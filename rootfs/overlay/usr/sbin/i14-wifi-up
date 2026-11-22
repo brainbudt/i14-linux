@@ -1,0 +1,43 @@
+#!/bin/sh
+# Power on the MediaTek Wi-Fi with Android's own tools. Android itself is gone; the two tools,
+# their linker and libraries, and the firmware live in /system inside this rootfs
+# (rootfs/build-alpine-rootfs.sh, list and hashes in rootfs/android-wifi.sha256).
+# They need: Android properties (/dev/__properties__), firmware in /etc/firmware and the
+# WMT character devices. Prints nothing on success; wlan0 exists afterwards.
+part() {
+	for u in /sys/block/mmcblk0/mmcblk0p*/uevent; do
+		grep -qx "PARTNAME=$1" "$u" && { d=${u%/uevent}; echo "/dev/${d##*/}"; return 0; }
+	done
+	return 1
+}
+[ -d /sys/class/net/wlan0 ] && exit 0
+[ -x /system/bin/wmt_loader ] || { echo "i14-wifi-up: no /system/bin/wmt_loader" >&2; exit 1; }
+[ -e /dev/__properties__ ] || install -m 444 /etc/i14/android-properties /dev/__properties__
+# The driver reads its MAC address and calibration from /data/nvram/APCFG/APRDEB/WIFI when the chip
+# powers on (Android: /data/nvram -> /nvdata, the nvdata partition). Without it, it makes up a new
+# MAC on every start. Read-only, and noload: not even a journal replay writes to the partition.
+mountpoint -q /nvdata || mount -t ext4 -o ro,noload "$(part nvdata)" /nvdata ||
+	echo "i14-wifi-up: nvdata not mounted; the Wi-Fi MAC will be random" >&2
+node() { # node NAME MAJOR: a character device, even if something left a plain file there
+	[ -c /dev/$1 ] || { rm -f /dev/$1; mknod -m 600 /dev/$1 c $2 0; }
+}
+node stpwmt 190
+node wmtdetect 154
+cd /
+# wmt_loader sets up the Wi-Fi driver; it exits 255 because it cannot *set* properties.
+# Never run it twice in one boot: a second run crashes the kernel (sdio_detect_exit).
+grep -q ' mtk_wmt_WIFI_chrdev$' /proc/devices || /system/bin/wmt_loader >/dev/null 2>&1
+pidof 6620_launcher >/dev/null ||
+	start-stop-daemon -S -b -m -p /run/6620_launcher.pid -x /system/bin/6620_launcher -- -p /system/etc/firmware/
+i=0
+until node wmtWifi 153 && echo 1 >/dev/wmtWifi 2>/dev/null; do
+	i=$((i + 1))
+	[ $i -le 30 ] || exit 1
+	sleep 2
+done
+i=0
+until [ -d /sys/class/net/wlan0 ]; do
+	i=$((i + 1))
+	[ $i -le 15 ] || exit 1
+	sleep 1
+done

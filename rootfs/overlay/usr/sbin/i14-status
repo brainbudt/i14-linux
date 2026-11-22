@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""I14 status screen. The display stays off to save power (i14-power blanks it).
+
+- Short press on the power button: show battery, charging, network and time for 20 s.
+  Press again to switch off at once.
+- Hold the power button for 3 s: power off cleanly (with the charger attached the
+  phone then charges in Android's power-off charging mode).
+- At start the status is shown once.
+
+Draws straight into the MediaTek framebuffer (/dev/fb0, 32-bit RGBA) with a Terminus
+console font; there is no text console in the stock kernel.
+"""
+import fcntl
+import gzip
+import mmap
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+FONT = "/usr/share/consolefonts/ter-132b.psf.gz"
+FB = "/dev/fb0"
+BLANK = "/sys/class/graphics/fb0/blank"
+BACKLIGHT = "/sys/class/leds/lcd-backlight/brightness"
+BAT = "/sys/class/power_supply/battery"
+FG_CURRENT = "/sys/devices/platform/battery_meter/FG_Current"  # 0.1 mA, negative = into the battery
+KEY_POWER, EV_KEY, EV_SYN, SYN_REPORT, SYN_DROPPED = 116, 1, 0, 0, 3
+EVIOCGKEY = 0x80604518     # _IOR('E', 0x18, 96): bitmap of keys that are down now
+EVIOCSCLOCKID = 0x400445A0  # _IOW('E', 0xa0, int): event timestamps from CLOCK_MONOTONIC
+SHOW_SECONDS, HOLD_SECONDS, REFRESH = 20, 3.0, 2.0
+FBIOGET_VSCREENINFO, FBIOPAN_DISPLAY = 0x4600, 0x4606
+WHITE, GREY, GREEN, RED, BLUE = (240, 240, 240), (150, 150, 150), (80, 220, 100), (240, 80, 70), (90, 160, 255)
+
+
+def read(path, default="?"):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except OSError:
+        pass
+
+
+class Font:
+    """PSF2 bitmap font (Terminus) with its unicode table."""
+
+    def __init__(self, path):
+        data = gzip.open(path).read()
+        if data[:4] != b"\x72\xb5\x4a\x86":
+            raise ValueError("not a PSF2 font")
+        _, hdr, flags, count, self.size, self.h, self.w = struct.unpack_from("<7I", data, 4)
+        self.rowbytes = (self.w + 7) // 8
+        self.glyphs = data[hdr:hdr + count * self.size]
+        self.map = {}
+        if flags & 1:  # unicode table: per glyph, UTF-8 chars, then sequences after 0xFE, ended by 0xFF
+            for index, entry in enumerate(data[hdr + count * self.size:].split(b"\xff")[:count]):
+                for ch in entry.split(b"\xfe")[0].decode("utf-8", "ignore"):
+                    self.map.setdefault(ch, index)
+        else:
+            self.map = {chr(i): i for i in range(min(count, 256))}
+        self.cache = {}
+
+    def rows(self, ch, scale, color):
+        """Pixel rows (RGBA bytes) for one character, already scaled."""
+        key = (ch, scale, color)
+        if key not in self.cache:
+            index = self.map.get(ch, self.map.get("?", 0))
+            g = self.glyphs[index * self.size:(index + 1) * self.size]
+            on, off = bytes(color) + b"\xff", b"\0\0\0\xff"
+            out = []
+            for y in range(self.h):
+                bits = int.from_bytes(g[y * self.rowbytes:(y + 1) * self.rowbytes], "big")
+                row = b"".join((on if bits >> (self.rowbytes * 8 - 1 - x) & 1 else off) * scale for x in range(self.w))
+                out.extend([row] * scale)
+            self.cache[key] = out
+        return self.cache[key]
+
+
+class Screen:
+    def __init__(self, font):
+        self.font = font
+        self.fd = os.open(FB, os.O_RDWR)
+        self.var = bytearray(160)
+        fcntl.ioctl(self.fd, FBIOGET_VSCREENINFO, self.var)
+        self.xres, self.yres, self.xvirt, self.yvirt = struct.unpack_from("4I", self.var, 0)
+        self.line = self.xvirt * 4
+        self.mem = mmap.mmap(self.fd, self.line * self.yres)
+        self.on = False
+
+    def draw(self, lines):
+        """lines: (text, scale, color, gap) from the top; text is clipped to the width."""
+        frame = bytearray(b"\0\0\0\xff" * (self.line // 4) * self.yres)
+        y = 60
+        for text, scale, color, gap in lines:
+            y += gap
+            fit = (self.xres - 40) // (self.font.w * scale)
+            glyphs = [self.font.rows(ch, scale, color) for ch in text[:fit]]
+            height = self.font.h * scale
+            if y + height > self.yres:
+                break
+            for r in range(height):
+                row = b"".join(g[r] for g in glyphs)
+                start = (y + r) * self.line + 20 * 4
+                frame[start:start + len(row)] = row
+            y += height
+        self.mem[:] = frame
+        struct.pack_into("2I", self.var, 16, 0, 0)  # show buffer 0
+        fcntl.ioctl(self.fd, FBIOPAN_DISPLAY, self.var)
+
+    def power(self, on):
+        if on and not self.on:
+            write(BLANK, "0")
+            write(BACKLIGHT, "120")
+        elif not on and self.on:
+            write(BACKLIGHT, "0")
+            write(BLANK, "4")
+        self.on = on
+
+
+def addresses():
+    out = {}
+    try:
+        text = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return out
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) > 3 and parts[1] != "lo":
+            out[parts[1]] = parts[3].split("/")[0]
+    return out
+
+
+def ssid():
+    try:
+        text = subprocess.run(["iw", "dev", "wlan0", "link"], capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in text.splitlines():
+        if line.strip().startswith("SSID:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def status_lines(note=""):
+    cap, st = read(BAT + "/capacity"), read(BAT + "/status")
+    words = {"Charging": "laden", "Discharging": "ontladen", "Full": "vol", "Not charging": "niet laden"}
+    try:
+        ma = -int(read(FG_CURRENT, "0")) // 10
+        current = f"{ma:+d} mA"
+    except ValueError:
+        current = "? mA"
+    try:
+        volt = f"{int(read(BAT + '/batt_vol', '0')) / 1000:.2f} V"
+    except ValueError:
+        volt = "? V"
+    color = GREEN if st in ("Charging", "Full") else (RED if cap.isdigit() and int(cap) <= 15 else WHITE)
+    up = int(float(read("/proc/uptime", "0").split()[0]))
+    ip = addresses()
+    net = ssid()
+    lines = [
+        (time.strftime("%H:%M"), 6, WHITE, 0),
+        (time.strftime("%d-%m-%Y"), 2, GREY, 10),
+        (f"Accu {cap}%", 3, color, 70),
+        (f"{words.get(st, st)}, {current}", 2, color, 10),
+        (volt, 2, GREY, 6),
+        ("Wi-Fi", 2, BLUE, 60),
+        (net or "niet verbonden", 2, WHITE, 6),
+        (ip.get("wlan0", ""), 2, WHITE, 6),
+        ("USB", 2, BLUE, 40),
+        (ip.get("rndis0", "uit"), 2, WHITE, 6),
+        (f"aan sinds {up // 3600} u {up % 3600 // 60:02d} m", 2, GREY, 60),
+        ("I14 Linux - Alpine", 2, GREY, 6),
+        ("knop kort: scherm", 2, GREY, 50),
+        ("knop 3 s: uitzetten", 2, GREY, 6),
+    ]
+    if note:
+        lines.insert(0, (note, 3, RED, 0))
+    return lines
+
+
+def power_key():
+    for name in sorted(os.listdir("/sys/class/input")):
+        if name.startswith("event") and read(f"/sys/class/input/{name}/device/name", "") == "mtk-kpd":
+            fd = os.open(f"/dev/input/{name}", os.O_RDONLY | os.O_NONBLOCK)
+            fcntl.ioctl(fd, EVIOCSCLOCKID, struct.pack("i", time.CLOCK_MONOTONIC))
+            return fd
+    raise SystemExit("power key input (mtk-kpd) not found")
+
+
+def key_down(fd):
+    """Ask the kernel whether the power key is down right now (independent of queued events)."""
+    bits = bytearray(96)
+    try:
+        fcntl.ioctl(fd, EVIOCGKEY, bits)
+    except OSError:
+        return False
+    return bool(bits[KEY_POWER // 8] >> (KEY_POWER % 8) & 1)
+
+
+def shutdown(screen):
+    screen.power(True)
+    screen.draw([("Uitschakelen...", 3, RED, 0)])
+    time.sleep(1)
+    subprocess.run(["poweroff"])
+
+
+def run(screen, keys):
+    until = time.monotonic() + SHOW_SECONDS  # show once at start
+    pressed = None  # monotonic time of the power key press (from the event itself)
+    next_draw = 0.0
+    dropped = False  # after SYN_DROPPED: skip events up to the next SYN_REPORT, then resync
+    while True:
+        now = time.monotonic()
+        if pressed is not None and now - pressed >= HOLD_SECONDS:
+            if key_down(keys):
+                shutdown(screen)
+                return
+            pressed = None  # the release got lost; the key is up
+        if now < until:
+            if now >= next_draw:
+                screen.draw(status_lines())
+                screen.power(True)
+                next_draw = time.monotonic() + REFRESH
+        elif screen.on:
+            screen.power(False)
+        if pressed is not None:
+            wait = 0.2
+        elif screen.on:
+            wait = min(REFRESH, max(0.05, until - time.monotonic()))
+        else:
+            wait = None  # sleep until the next key event
+        ready, _, _ = select.select([keys], [], [], wait)
+        if not ready:
+            continue
+        data = os.read(keys, 24 * 64)
+        for i in range(0, len(data) - 23, 24):
+            sec, usec, etype, code, value = struct.unpack_from("qqHHi", data, i)
+            if etype == EV_SYN and code == SYN_DROPPED:  # the kernel lost events
+                dropped, pressed = True, None
+                continue
+            if dropped:
+                if etype == EV_SYN and code == SYN_REPORT:
+                    dropped = False  # resync from the kernel's key state, with a fresh hold timer
+                    pressed = time.monotonic() if key_down(keys) else None
+                continue
+            if etype != EV_KEY or code != KEY_POWER:
+                continue
+            stamp = sec + usec / 1e6
+            if value == 1:
+                pressed = stamp
+            elif value == 0 and pressed is not None:  # value 2 (auto-repeat) is ignored
+                held, pressed = stamp - pressed, None
+                if held >= HOLD_SECONDS:
+                    shutdown(screen)
+                    return
+                if screen.on:
+                    until = 0.0
+                else:
+                    until = time.monotonic() + SHOW_SECONDS
+                    next_draw = 0.0
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    screen = Screen(Font(FONT))
+    keys = power_key()
+    try:
+        run(screen, keys)
+    finally:  # never leave the display on (stop, error, failed poweroff)
+        write(BACKLIGHT, "0")
+        write(BLANK, "4")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,57 @@
+{
+  "checked_at_utc": "2026-11-05T20:42:19.771950+00:00",
+  "publication_mode": "clean source snapshot; original local history excluded",
+  "host_tests": {
+    "command": "python -B -m unittest discover -s tests -p test_i14_*.py -v",
+    "agent_host": "macOS",
+    "command_host": "macOS",
+    "working_directory": "controlled publication snapshot",
+    "python": "Python 3.13.17",
+    "exit_code": 0,
+    "elapsed_seconds": 50.065,
+    "tests": 346,
+    "skips": [
+      "setUpClass (test_i14_linux.BootImage) ... skipped 'requires local stock boot backup, BusyBox and e2fsck'",
+      "test_writer_matches_stock_ordering (test_i14_linux.Properties.test_writer_matches_stock_ordering) ... skipped 'no stock property dump'",
+      "test_i14init_uses_only_shipped_applets (test_i14_linux.Scripts.test_i14init_uses_only_shipped_applets) ... skipped 'requires local BusyBox and e2fsck build inputs'",
+      "test_refuses_to_overwrite (test_i14_logo_sign.LogoSign.test_refuses_to_overwrite) ... skipped 'key, lk.img or stock logo not present'",
+      "test_rejects_a_key_for_another_modulus (test_i14_logo_sign.LogoSign.test_rejects_a_key_for_another_modulus) ... skipped 'key, lk.img or stock logo not present'",
+      "test_signs_and_verifies_with_lks_key (test_i14_logo_sign.LogoSign.test_signs_and_verifies_with_lks_key) ... skipped 'key, lk.img or stock logo not present'"
+    ],
+    "resource_warnings": true,
+    "initial_attempt": {
+      "errors": 2,
+      "cause": "stock boot backup and static build inputs absent; tests now explicitly skip these prerequisites"
+    }
+  },
+  "build_input_tests": {
+    "exit_code": 0,
+    "scope": "BootImage and shipped applet tests with existing local firmware/build inputs",
+    "working_directory": "original project checkout",
+    "command_host": "macOS"
+  },
+  "secrets_scan": {
+    "tool": "gitleaks",
+    "mode": "directory",
+    "exit_code": 0,
+    "findings": 0
+  },
+  "content_checks": {
+    "sensitive_filetypes": 0,
+    "sensitive_literals": 0,
+    "broken_local_links": 0,
+    "unchanged_screenshot_hashes": 4
+  },
+  "readme_render": {
+    "renderer": "GitHub Markdown API",
+    "images": 3,
+    "tables": 2,
+    "passed": true
+  },
+  "limits": [
+    "No full clean-clone firmware/rootfs build was performed.",
+    "Host tests do not establish hardware, full charging-cycle, empty-battery recovery or multi-day acceptance.",
+    "Existing DNS-report tests emit ResourceWarning for unclosed fixture files; test exit remains 0.",
+    "The selected publication contains existing source; it is not a fresh implementation or a binary release."
+  ]
+}

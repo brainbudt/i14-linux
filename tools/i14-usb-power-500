@@ -1,0 +1,77 @@
+#!/bin/sh
+# Fixed descriptor repair only; no charging operation or automatic retry.
+set -eu
+[ "$#" -eq 0 ]
+root=0
+while read -r label real effective saved filesystem rest; do
+    [ "$label" = Uid: ] || continue
+    [ "$real:$effective:$saved:$filesystem:$rest" = 0:0:0:0: ]
+    root=1; break
+done </proc/self/status
+[ "$root" -eq 1 ]
+sum=$(sha256sum /proc/device-tree/model)
+[ "${sum%% *}" = 9282e73850f4d515884c1a11a270f1d3f218a302b35875aa6e17639bfe38726a ]
+sum=$(sha256sum /proc/device-tree/compatible)
+[ "${sum%% *}" = 867d5ca5770c5871fe10fdfdd4a8523764877c7246b9c21bd9714380bafccd9a ]
+g=/sys/kernel/config/usb_gadget/i14
+udc=musb-hdrc.3.auto
+[ "$(cat "$g/idVendor")" = 0x1d6b ]
+[ "$(cat "$g/idProduct")" = 0x0104 ]
+[ "$(cat "$g/strings/0x409/serialnumber")" = I14_NATIVE_INIT ]
+[ "$(cat "$g/configs/c.1/bmAttributes")" = 0xc0 ]
+[ "$(cat "$g/configs/c.1/MaxPower")" = 2 ]
+[ "$(cat "$g/UDC")" = "$udc" ]
+[ "$(cat "/sys/class/udc/$udc/state")" = configured ]
+set -- /sys/class/udc/*
+[ "$#" -eq 1 ] && [ "$1" = "/sys/class/udc/$udc" ] || exit 1
+set -- "$g/configs/"*
+[ "$#" -eq 1 ] && [ "$1" = "$g/configs/c.1" ] || exit 1
+set -- "$g/functions/"*
+[ "$#" -eq 2 ] && [ "$1" = "$g/functions/acm.usb0" ] && [ "$2" = "$g/functions/ecm.usb0" ] || exit 1
+for function in acm.usb0 ecm.usb0; do
+    [ -L "$g/configs/c.1/$function" ]
+    [ "$(cd -P "$g/configs/c.1/$function" && pwd -P)" = "$g/functions/$function" ]
+done
+run=/run/
+[ ! -L "${run%/}" ]
+[ "$(cd -P "$run" && pwd -P)/" = "$run" ]
+root_count=0
+root_ram=0
+run_ram=0
+while read -r device point type rest; do
+    case "$point" in
+        /)
+            root_count=$((root_count + 1))
+            [ "$device:$type" != rootfs:rootfs ] || root_ram=1
+            ;;
+        /run)
+            [ "$type" = tmpfs ]; run_ram=1
+            ;;
+        '/run'/*)
+            [ "$type" = tmpfs ]
+            ;;
+    esac
+done </proc/mounts
+# The installed initramfs keeps /run directly on the RAM-backed rootfs.
+[ "$run_ram" -eq 1 ] || [ "$root_count:$root_ram" = 1:1 ]
+umask 077
+run=${run}i14-usb-power-500.$$
+mkdir "$run"
+printf '500\n' >"$g/configs/c.1/MaxPower"
+[ "$(cat "$g/configs/c.1/MaxPower")" = 500 ]
+# Inherit ignored HUP before forking, so the ACM disconnect cannot kill this child.
+trap '' HUP
+(
+    trap 'status=$?; [ "$status" -eq 0 ] || echo "ERROR status=$status; inspect before retry"' EXIT
+    sleep 1
+    [ "$(cat "$g/UDC")" = "$udc" ]
+    [ "$(cat "$g/configs/c.1/MaxPower")" = 500 ]
+    [ "$(cat "$g/configs/c.1/bmAttributes")" = 0xc0 ]
+    printf '\n' >"$g/UDC"
+    sleep 1
+    printf '%s\n' "$udc" >"$g/UDC"
+    [ "$(cat "$g/UDC")" = "$udc" ]
+    echo 'DONE descriptor=500mA; host configuration still requires verification'
+) </dev/null >"$run/log" 2>&1 &
+printf '%s\n' "$!" >"$run/pid"
+printf 'STARTED %s\n' "$run"

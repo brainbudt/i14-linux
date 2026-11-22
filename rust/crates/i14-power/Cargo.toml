@@ -1,0 +1,19 @@
+[package]
+name = "i14-power"
+description = "I14 battery guard: BCCT charge limit and low-battery shutdown (port of i14ui/charging.py + bcct.py)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+
+[dependencies]
+i14-config = { path = "../i14-config" }
+i14-sys = { path = "../i14-sys" }
+# float_roundtrip: timestamps read back from the status file must parse exactly as Python's json does.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+libc.workspace = true
+
+[[bin]]
+name = "i14-battery-guard"
+path = "src/main.rs"

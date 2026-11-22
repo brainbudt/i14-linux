@@ -1,0 +1,108 @@
+#!/bin/sh
+# Offline preparation only: vendor probes may perform PMIC I/O before /init.
+set -eu
+log() { printf '%s\n' "$*"; }
+mounts() {
+    mount -t proc -o nosuid,nodev,noexec proc /proc || return 1
+    mount -t sysfs -o nosuid,nodev,noexec sysfs /sys || return 1
+    mount -t devtmpfs -o nosuid devtmpfs /dev ||
+        mount -t tmpfs -o nosuid,mode=0755 tmpfs /dev || return 1
+    mount -t tmpfs -o nosuid,nodev,noexec,mode=0755 tmpfs /run || return 1
+}
+identity() {
+    read -r release rest </proc/sys/kernel/osrelease || return 1
+    [ "$release" = 3.18.19 ] || return 1
+    # Exact own stock root properties; same SoC name alone is not device custody.
+    model=$(sha256sum /proc/device-tree/model) || return 1
+    compatible=$(sha256sum /proc/device-tree/compatible) || return 1
+    [ "${model%% *}" = 77a29783599bebf2f2e339bea3f14992c9870f6f08bb211cd1a62da9ebbfe5ae ] || return 1
+    [ "${compatible%% *}" = 33d69af0dce2161bb2211a0bb3c91313905301bae14f4d474de0204a74a4b47a ] || return 1
+    log "I14_STOCK_KERNEL release=$release model=MT6735 compatible=mediatek,MT6735"
+    dmesg || return 1
+}
+requirements() {
+    # Refuse incomplete userspace before any virtual mounts or gadget writes.
+    command -v blockdev >/dev/null 2>&1 || return 78
+    command -v mdev >/dev/null 2>&1 || return 78
+}
+storage_nodes() {
+    # MMC probes may finish after /init; tmpfs has no automatic node updates.
+    node_scan_count=0
+    while :; do
+        mdev -s || return 1
+        node_count=0
+        for node in /dev/mmcblk0 /dev/mmcblk0boot* /dev/mmcblk0p*; do
+            if [ -b "$node" ]; then node_count=$((node_count + 1)); fi
+        done
+        [ "$node_count" -ne 26 ] || return 0
+        [ "$node_count" -lt 26 ] || return 1
+        node_scan_count=$((node_scan_count + 1))
+        [ "$node_scan_count" -lt 10 ] || return 1
+        sleep 1 || return 1
+    done
+}
+storage_guard() {
+    /storage-readonly || return 1
+    count=0
+    read -r capacity </run/i14-storage-ro.ready || return 1
+    [ "$capacity" = capacity_bytes=15634268160 ] || return 1
+    for node in /dev/mmcblk0 /dev/mmcblk0boot* /dev/mmcblk0p*; do
+        [ -b "$node" ] || return 1
+        case "$node" in
+            /dev/mmcblk0|/dev/mmcblk0boot0|/dev/mmcblk0boot1) ;;
+            /dev/mmcblk0p[1-9]|/dev/mmcblk0p1[0-9]|/dev/mmcblk0p2[0-3]) ;;
+            *) return 1 ;;
+        esac
+        [ "$(blockdev --getro "$node")" = 1 ] || return 1
+        count=$((count + 1))
+    done
+    [ "$count" = 26 ] || return 1
+    [ "$(blockdev --getsize64 /dev/mmcblk0)" = 15634268160 ] || return 1
+    log 'I14_STOCK_STORAGE_26_RO'
+}
+write_usb() { printf '%s' "$2" >"/sys/class/android_usb/android0/$1"; }
+gadget() {
+    # Own stock init.mt6735.usb.rc lines 39-48; no port_index override.
+    write_usb enable 0 || return 1
+    write_usb idVendor 0E8D || return 1
+    write_usb idProduct 2007 || return 1
+    write_usb iManufacturer 'I14 offline trial' || return 1
+    write_usb iProduct 'Stock charge trial' || return 1
+    write_usb iSerial I14-STOCK-TRIAL-20261101 || return 1
+    write_usb f_acm/instances 1 || return 1
+    write_usb functions acm || return 1
+    write_usb bDeviceClass 02 || return 1
+    write_usb enable 1 || return 1
+}
+return_boot() {
+    log I14_STOCK_RETURN_REQUEST
+    reboot -f || return 1
+    log I14_STOCK_RETURN_FAILED
+    return 1
+}
+console() {
+    # ttyGS0 assignment and 3.18 syscall compatibility remain UNTESTED.
+    [ -c /dev/ttyGS0 ] || return 1
+    setsid sh </dev/ttyGS0 >/dev/ttyGS0 2>&1 &
+}
+trial() {
+    requirements || return $?
+    mounts || return 1
+    identity || return 1
+    storage_nodes || return 1
+    storage_guard || return 1
+    gadget || return 1
+    # ACM registers ttyGS0 during normal gadget setup.
+    mdev -s || return 1
+    console || return 1
+}
+main() {
+    log I14_OWN_STOCK_INIT_BEGIN
+    # Finite software timer, NOT an independent fail-safe; covers guard failures.
+    (sleep 120; return_boot) &
+    trial
+}
+# ENTRYPOINT
+if main; then :; else log I14_STOCK_INIT_GUARD_FAILED; fi
+# PID1 must not silently exit if a guard or normal reboot fails.
+while :; do sleep 60; done

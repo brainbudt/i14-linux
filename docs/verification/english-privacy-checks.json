@@ -1,0 +1,83 @@
+{
+  "checked_at_utc": "2026-11-05T20:54:22.760249+00:00",
+  "documentation_language": "English",
+  "status_table_headers": [
+    "Component",
+    "Working",
+    "Notes"
+  ],
+  "translated_files": [
+    "README.md",
+    "docs/STATUS.md",
+    "docs/HARDWARE.md",
+    "docs/HISTORY.md",
+    "docs/SCREENSHOTS.md",
+    "docs/DEVELOPMENT.md",
+    "docs/PUBLISHING.md"
+  ],
+  "privacy_cleanup_categories": [
+    "personal backup-volume paths replaced by neutral examples",
+    "personal DNS target removed; explicit I14_DNS required",
+    "monitoring-host name removed",
+    "matching personal address in a synthetic test fixture replaced by a documentation address"
+  ],
+  "privacy_source_files": [
+    "scripts/i14-dns-soak.py",
+    "scripts/i14-logo.py",
+    "scripts/restore-stock-logo.py",
+    "tests/test_i14_logo.py",
+    "tests/test_i14_logo_sign.py",
+    "tests/test_i14_ui.py"
+  ],
+  "host_tests": {
+    "exit_code": 0,
+    "tests": 346,
+    "elapsed_seconds": 49.765,
+    "skips": [
+      "setUpClass (test_i14_linux.BootImage) ... skipped 'requires local stock boot backup, BusyBox and e2fsck'",
+      "test_writer_matches_stock_ordering (test_i14_linux.Properties.test_writer_matches_stock_ordering) ... skipped 'no stock property dump'",
+      "test_i14init_uses_only_shipped_applets (test_i14_linux.Scripts.test_i14init_uses_only_shipped_applets) ... skipped 'requires local BusyBox and e2fsck build inputs'",
+      "test_case_and_firmlink_aliases_are_refused (test_i14_logo.BackupVolumeGuardTests.test_case_and_firmlink_aliases_are_refused) ... skipped '/Volumes/I14_BACKUP not mounted'",
+      "test_boot_logo_colours_read_as_white_with_orange_text (test_i14_logo.RealBackupTests.test_boot_logo_colours_read_as_white_with_orange_text) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_cli_replace_with_extracted_pixels_is_byte_identical (test_i14_logo.RealBackupTests.test_cli_replace_with_extracted_pixels_is_byte_identical) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_identity_rebuild_is_byte_identical (test_i14_logo.RealBackupTests.test_identity_rebuild_is_byte_identical) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_noise_is_refused_by_stock_limit_and_partition_size (test_i14_logo.RealBackupTests.test_noise_is_refused_by_stock_limit_and_partition_size) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_recompressed_rebuild_is_identical_or_equivalent (test_i14_logo.RealBackupTests.test_recompressed_rebuild_is_identical_or_equivalent) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_replacing_boot_logos_changes_only_0_and_88 (test_i14_logo.RealBackupTests.test_replacing_boot_logos_changes_only_0_and_88) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_signature_is_checked_on_replace_and_required_by_verify (test_i14_logo.RealBackupTests.test_signature_is_checked_on_replace_and_required_by_verify) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_signature_is_valid_and_breaks_on_change (test_i14_logo.RealBackupTests.test_signature_is_valid_and_breaks_on_change) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_structure_matches_the_authoritative_table (test_i14_logo.RealBackupTests.test_structure_matches_the_authoritative_table) ... skipped '/Volumes/I14_BACKUP/i14-backups/20261102-phase0/logo.img not present'",
+      "test_refuses_to_overwrite (test_i14_logo_sign.LogoSign.test_refuses_to_overwrite) ... skipped 'key, lk.img or stock logo not present'",
+      "test_rejects_a_key_for_another_modulus (test_i14_logo_sign.LogoSign.test_rejects_a_key_for_another_modulus) ... skipped 'key, lk.img or stock logo not present'",
+      "test_signs_and_verifies_with_lks_key (test_i14_logo_sign.LogoSign.test_signs_and_verifies_with_lks_key) ... skipped 'key, lk.img or stock logo not present'"
+    ],
+    "command_host": "macOS",
+    "scope": "published snapshot, no device access"
+  },
+  "focused_checks": {
+    "logo_test_exit_code": 0,
+    "elapsed_seconds": 1.498,
+    "dns_missing_target": "expected refusal verified",
+    "source_scope": "published snapshot only; no device or LAN tests"
+  },
+  "content_checks": {
+    "links": "passed",
+    "tables": "Component | Working | Notes",
+    "screenshots": "all four hashes unchanged",
+    "privacy_patterns": "no matches",
+    "gitleaks_findings": 0
+  },
+  "screenshots": {
+    "files": 4,
+    "byte_identical_to_originals": true,
+    "visual_privacy_review": "no personal network names or identifiers visible",
+    "metadata_review": "listing captures contain only EXIF image dimensions; device captures have no EXIF"
+  },
+  "git_identity": "GitHub handle and GitHub noreply email",
+  "history_policy": "privacy cleanup applied to every commit reachable from published main; original local development history retained",
+  "limits": [
+    "No device tests or full firmware/rootfs build performed for this documentation and privacy update.",
+    "Historical runtime and publication reports retain their original timestamps and scope.",
+    "Dutch text inside original screenshots is preserved."
+  ]
+}

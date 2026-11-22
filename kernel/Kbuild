@@ -1,0 +1,2 @@
+obj-m += i14-reboot-target.o
+obj-m += i14-charger.o

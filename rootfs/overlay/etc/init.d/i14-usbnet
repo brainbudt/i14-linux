@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+description="I14: USB ethernet to the computer (172.16.42.1, computer gets .2 via DHCP)"
+command=/usr/sbin/udhcpd
+command_args="-f /etc/udhcpd.conf"
+command_background=yes
+pidfile=/run/i14-usbnet-udhcpd.pid
+G=/sys/class/android_usb/android0
+
+depend() {
+	need i14-firewall
+	after bootmisc
+}
+
+# /i14init enabled USB serial + ethernet long before this DHCP server runs, so the
+# computer has given up on DHCP. Re-plug the gadget so it asks again; that also
+# recreates rndis0, which then gets its address here.
+start_pre() {
+	# Every re-plug gives the computer side a new MAC, so old leases only block addresses.
+	rm -f /run/udhcpd.leases
+	echo 0 >$G/enable && echo 1 >$G/enable || return 1
+	i=0
+	while [ ! -e /sys/class/net/rndis0 ]; do
+		i=$((i + 1))
+		[ $i -le 20 ] || { eerror "rndis0 did not appear"; return 1; }
+		sleep 0.5
+	done
+	ip addr add 172.16.42.1/24 dev rndis0 2>/dev/null
+	ip link set rndis0 up
+}

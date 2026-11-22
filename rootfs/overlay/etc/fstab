@@ -1,0 +1,2 @@
+# / is rootfs.img on userdata, mounted by /i14init; userdata itself is /mnt/data.
+tmpfs	/tmp	tmpfs	nosuid,nodev,mode=1777	0 0

@@ -1,0 +1,14 @@
+[package]
+name = "i14-util"
+description = "Small I14 phone utilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+i14-sys = { path = "../i14-sys" }
+
+[[bin]]
+name = "i14-reboot-bootloader"
+path = "src/bin/i14-reboot-bootloader.rs"

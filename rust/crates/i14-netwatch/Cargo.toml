@@ -1,0 +1,11 @@
+[package]
+name = "i14-netwatch"
+description = "I14 Wi-Fi watchdog (DHCP client, association, address, gateway, local DNS); never reloads the driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+i14-sys = { path = "../i14-sys" }
+libc.workspace = true

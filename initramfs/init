@@ -1,0 +1,87 @@
+#!/bin/sh
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export I14_DEBUG_INITRAMFS=0
+[ ! -f /etc/i14-debug ] || export I14_DEBUG_INITRAMFS=1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /tmp /run
+mount -t devpts devpts /dev/pts
+klog() { printf '<6>%s\n' "$*" >/dev/kmsg 2>/dev/null || :; }
+klog I14_NATIVE_INIT
+klog "I14_NATIVE_UNAME $(uname -a)"
+case " $(cat /proc/cmdline) " in
+    *' i14.trial_reboot=off '*) klog I14_TRIAL_REBOOT_EXPLICITLY_DISABLED ;;
+    *)
+        (
+            sleeper=
+            trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; klog I14_TRIAL_REBOOT_CANCELLED; exit 0' TERM INT
+            sleep 120 &
+            sleeper=$!
+            wait "$sleeper" || exit 0
+            klog I14_TRIAL_AUTO_REBOOT
+            reboot -f
+        ) &
+        printf '%s\n' "$!" >/run/i14-trial-reboot.pid
+        klog "I14_TRIAL_REBOOT_ARMED 120s pid=$(cat /run/i14-trial-reboot.pid)"
+        ;;
+esac
+if ip link set dev lo up; then klog I14_LOOPBACK_UP; else klog I14_LOOPBACK_FAILED; fi
+exec </dev/console >/dev/console 2>&1
+echo I14_NATIVE_INIT
+uname -a
+if sh /storage-readonly >/run/storage-readonly.log 2>&1; then
+    klog I14_STORAGE_HELPER_COMPLETE
+else
+    klog "I14_STORAGE_HELPER_STOPPED status=$?"
+fi
+cat /run/storage-readonly.log
+if [ "$I14_DEBUG_INITRAMFS" = 1 ]; then
+    echo 'Configuring direct USB ECM diagnostics.'
+    if sh /usb-network >/run/usb-network.log 2>&1; then
+        klog I14_USB_HELPER_COMPLETE
+    else
+        klog "I14_USB_HELPER_FAILED status=$?"
+        echo 'USB setup failed.'
+    fi
+    cat /run/usb-network.log
+    while IFS= read -r line; do
+        case "$line" in *I14_*|*ERROR*|*WARNING*|*error*|*failed*|*busy*) klog "$line" ;; esac
+    done </run/usb-network.log
+else
+    klog I14_USB_HELPER_SKIPPED_NONDEBUG
+fi
+if [ -f /lib/modules/i14/evdev.ko ] || [ -f /lib/modules/i14/edt-ft5x06.ko ] ||
+   [ -f /lib/modules/i14/pwm-mtk-disp.ko ] || [ -f /lib/modules/i14/pwm_bl.ko ] || [ -x /usr/bin/i14-status ]; then
+    (
+        for module in /lib/modules/i14/evdev.ko /lib/modules/i14/edt-ft5x06.ko /lib/modules/i14/pwm-mtk-disp.ko /lib/modules/i14/pwm_bl.ko; do
+            [ -f "$module" ] || continue
+            if insmod "$module"; then
+                klog "I14_DISPLAY_MODULE_LOADED $module"
+            else
+                result=$?
+                echo "I14_DISPLAY_MODULE_FAILED $module status=$result"
+                klog "I14_DISPLAY_MODULE_FAILED $module status=$result"
+            fi
+        done
+        if [ -x /usr/bin/i14-status ]; then
+            /usr/bin/i14-status &
+            status_pid=$!
+            printf '%s\n' "$status_pid" >/run/i14-status.pid
+            klog "I14_STATUS_STARTED pid=$status_pid"
+            if wait "$status_pid"; then
+                klog I14_STATUS_EXITED
+            else
+                result=$?
+                echo "I14_STATUS_FAILED status=$result"
+                klog "I14_STATUS_FAILED status=$result"
+            fi
+        fi
+    ) >/run/i14-status.log 2>&1 &
+fi
+while :; do
+    if [ "$I14_DEBUG_INITRAMFS" = 1 ]; then
+        setsid cttyhack sh -i
+    fi
+    sleep 2
+done

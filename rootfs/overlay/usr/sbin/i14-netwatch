@@ -1,0 +1,81 @@
+#!/bin/sh
+# Wi-Fi watchdog (OpenRC i14-netwatch, under supervise-daemon). Every 30 s, layer by layer:
+#  - DHCP client gone: start it again.
+#  - not associated for 3 checks: ask wpa_supplicant to reassociate (again every 10 checks).
+#  - associated, but no IPv4 address or default route, or the gateway does not answer ping,
+#    for 3 checks: renew the DHCP lease (SIGUSR1), and reassociate when the gateway is silent.
+#  - the local DNS server (unbound, when it is in the default runlevel) does not answer its own
+#    health name for 3 checks: restart only unbound, again every 10 checks while it stays silent
+#    (a crash is handled by supervise-daemon; this catches a hang or a supervisor that gave up).
+# Never reloads the Wi-Fi driver (a second wmt_loader crashes the kernel) and never reboots;
+# wpa_supplicant itself is restarted by supervise-daemon (i14-wifi). While the user has switched
+# Wi-Fi off (flag file from i14-ui) only the DNS check runs.
+I=${I14_WIFI_IF:-wlan0}
+PID=${I14_UDHCPC_PID:-/run/i14-udhcpc-wlan0.pid}
+STEP=${I14_NETWATCH_S:-30}
+DNS_WANT=${I14_UNBOUND_WANT:-/etc/runlevels/default/unbound}
+OFF=${I14_WIFI_OFF:-/mnt/data/media/0/i14-linux/wifi-off} # Wi-Fi switched off in i14-ui: leave it alone
+fail=0 last=ok dnsfail=0
+log() { logger -t i14-netwatch "$*"; }
+while sleep "$STEP"; do
+	if [ -e "$DNS_WANT" ]; then # unbound is meant to run
+		if nslookup i14-health.invalid 127.0.0.1 2>/dev/null | grep -q 192.0.2.1; then
+			[ $dnsfail -lt 3 ] || log "DNS server answers again"
+			dnsfail=0
+		else
+			dnsfail=$((dnsfail + 1))
+			if [ $dnsfail -ge 3 ] && [ $(((dnsfail - 3) % 10)) -eq 0 ]; then
+				log "DNS server does not answer: restarting unbound"
+				rc-service unbound restart >/dev/null 2>&1
+			fi
+		fi
+	fi
+	if [ -e "$OFF" ]; then
+		[ "$last" = off ] || log "Wi-Fi switched off by the user: not checking it"
+		fail=0 last=off
+		continue
+	fi
+	p=$(cat "$PID" 2>/dev/null)
+	if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+		log "DHCP client not running: starting it"
+		udhcpc -b -i "$I" -p "$PID" -x hostname:i14 >/dev/null 2>&1
+		p=$(cat "$PID" 2>/dev/null)
+	fi
+	state=$(wpa_cli -i "$I" status 2>/dev/null | sed -n 's/^wpa_state=//p')
+	gw=$(ip -4 route show default dev "$I" 2>/dev/null | awk '{print $3; exit}')
+	if [ "$state" != COMPLETED ]; then
+		now="not associated (${state:-no answer from wpa_supplicant})"
+	elif ! ip -4 addr show dev "$I" 2>/dev/null | grep -q ' inet '; then
+		now="no IPv4 address"
+	elif [ -z "$gw" ]; then
+		now="no default route"
+	elif ! ping -c 1 -W 3 -I "$I" "$gw" >/dev/null 2>&1; then
+		now="gateway $gw does not answer"
+	else
+		now=ok
+	fi
+	if [ "$now" = ok ]; then
+		[ "$last" = ok ] || log "Wi-Fi works again (after $fail checks: $last)"
+		fail=0 last=ok
+		continue
+	fi
+	fail=$((fail + 1))
+	[ "$now" = "$last" ] || log "problem: $now"
+	last=$now
+	[ $fail -ge 3 ] && [ $(((fail - 3) % 10)) -eq 0 ] || continue
+	case "$now" in
+	not\ associated*)
+		log "reassociate"
+		wpa_cli -i "$I" reassociate >/dev/null 2>&1
+		;;
+	gateway*)
+		log "reassociate and renew the DHCP lease"
+		wpa_cli -i "$I" reassociate >/dev/null 2>&1
+		[ -n "$p" ] && kill -USR1 "$p" 2>/dev/null
+		;;
+	*)
+		log "renew the DHCP lease"
+		[ -n "$p" ] && kill -USR1 "$p" 2>/dev/null
+		;;
+	esac
+done

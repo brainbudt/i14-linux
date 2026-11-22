@@ -1,0 +1,4 @@
+#!/bin/sh
+# End of boot (local runs last in the default runlevel): stop the boot splash; it then switches the display off.
+touch /run/i14-splash.stop
+exit 0

@@ -1,0 +1,11 @@
+# IPv6 firewall, same idea as firewall.rules. ICMPv6 (58) stays open: neighbour discovery and router
+# adverts need it. Management and DNS listen for clients over IPv4 only.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m state --state INVALID -j DROP
+-A INPUT -p 58 -j ACCEPT
+COMMIT

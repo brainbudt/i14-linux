@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Animated boot splash on /dev/fb0 (Linux layer of the I14 splash; assets from scripts/build-splash.py).
+
+Starts in the sysinit runlevel, draws the base image (identical to the LK logo) and animates a blinking
+cursor and "booting" dots until /run/i14-splash.stop appears (etc/local.d, end of boot), SIGTERM, or 60 s.
+Below "booting" the screen shows the last kernel log lines (/dev/kmsg, from boot on), live.
+Then it switches the display off, as i14-power would have done (i14-power skips that while we run).
+Stdlib only. Any problem with the screen or the assets: exit quietly, the boot goes on.
+"""
+import base64
+import collections
+import errno
+import fcntl
+import gzip
+import json
+import mmap
+import os
+import re
+import signal
+import struct
+import sys
+import time
+import zlib
+
+FB = os.environ.get("I14_FB", "/dev/fb0")
+ASSETS = os.environ.get("I14_SPLASH_ASSETS", "/usr/share/i14-splash")
+STOP = os.environ.get("I14_SPLASH_STOP", "/run/i14-splash.stop")
+BLANK = "/sys/class/graphics/fb0/blank"
+BACKLIGHT = "/sys/class/leds/lcd-backlight/brightness"
+LIMIT_S = 60
+KMSG = os.environ.get("I14_KMSG", "/dev/kmsg")
+FONT = "/usr/share/consolefonts/ter-118n.psf.gz"  # Terminus 10x18: 70 columns on 720 px
+LOG_TOP, LOG_COLOR, LOG_MARGIN = 1065, (150, 170, 200), 12  # just under "booting...", down to the bottom
+MTK_PREFIX = re.compile(r"^\s*-?\(\d+\)\[\d+:[^\]]*\]")  # "(0)[178:wdtk-0]" before each MediaTek line
+FBIOGET_VSCREENINFO, FBIOPAN_DISPLAY = 0x4600, 0x4606
+
+
+def load(assets=ASSETS):
+    with open(os.path.join(assets, "anim.json")) as f:
+        anim = json.load(f)
+    with open(os.path.join(assets, "base.rgba.z"), "rb") as f:
+        base = zlib.decompress(f.read())
+    if len(base) != anim["w"] * anim["h"] * 4:
+        raise ValueError("base image size does not match anim.json")
+    for name in ("cursor", "dots"):
+        x, y, w, h = anim[name]["box"]
+        anim[name]["states"] = [zlib.decompress(base64.b64decode(s)) for s in anim[name]["states"]]
+        if any(len(s) != w * h * 4 for s in anim[name]["states"]):
+            raise ValueError(f"{name} patch size does not match its box")
+    return anim, base
+
+
+def state(anim, tick):
+    """(cursor index, dots index) for a tick; the LK image is (0, 3): cursor on, three dots."""
+    c, d = anim["cursor"], anim["dots"]
+    return (tick // c["period_ticks"]) % len(c["states"]), (3 + tick // d["period_ticks"]) % len(d["states"])
+
+
+def swizzle(rgba, offsets):
+    """RGBA bytes into the framebuffer's byte order (offsets: bit offsets of R, G, B, A)."""
+    if offsets == (0, 8, 16, 24):
+        return rgba
+    out = bytearray(len(rgba))
+    for i, off in enumerate(offsets):
+        out[off // 8::4] = rgba[i::4]
+    return bytes(out)
+
+
+class Fb:
+    def __init__(self, path=FB):
+        self.fd = os.open(path, os.O_RDWR)
+        self.var = bytearray(160)
+        fcntl.ioctl(self.fd, FBIOGET_VSCREENINFO, self.var)
+        self.xres, self.yres, self.xvirt = struct.unpack_from("3I", self.var, 0)
+        bpp = struct.unpack_from("I", self.var, 24)[0]
+        self.offsets = tuple(struct.unpack_from("I", self.var, o)[0] for o in (32, 44, 56, 68))
+        if bpp != 32:
+            raise ValueError(f"{bpp} bpp")
+        self.line = self.xvirt * 4
+        self.mem = mmap.mmap(self.fd, self.line * self.yres)
+
+    def blit(self, x, y, w, h, rgba):
+        px = swizzle(rgba, self.offsets)
+        for r in range(h):
+            start = (y + r) * self.line + x * 4
+            self.mem[start:start + w * 4] = px[r * w * 4:(r + 1) * w * 4]
+
+    def show(self):
+        struct.pack_into("2I", self.var, 16, 0, 0)  # buffer 0, as i14-status
+        fcntl.ioctl(self.fd, FBIOPAN_DISPLAY, self.var)
+
+
+class Font:
+    """PSF2 bitmap font (Terminus): per character the x offsets of the set pixels in each row."""
+
+    def __init__(self, path):
+        data = gzip.open(path).read()
+        self.map = {}
+        if data[:4] == b"\x72\xb5\x4a\x86":  # PSF2
+            _, hdr, flags, count, self.size, self.h, self.w = struct.unpack_from("<7I", data, 4)
+            table = data[hdr + count * self.size:]
+            if flags & 1:  # per glyph: UTF-8 chars, sequences after 0xFE, ended by 0xFF
+                for index, entry in enumerate(table.split(b"\xff")[:count]):
+                    for ch in entry.split(b"\xfe")[0].decode("utf-8", "ignore"):
+                        self.map.setdefault(ch, index)
+        elif data[:2] == b"\x36\x04":  # PSF1: 8 px wide, 256 or 512 glyphs
+            mode, self.h = data[2], data[3]
+            hdr, count, self.size, self.w = 4, 512 if mode & 1 else 256, data[3], 8
+            if mode & 2:  # per glyph: UCS-2 values, sequences after 0xFFFE, ended by 0xFFFF
+                vals = struct.unpack_from(f"<{(len(data) - hdr - count * self.size) // 2}H", data, hdr + count * self.size)
+                index, seq = 0, False
+                for v in vals:
+                    if v == 0xFFFF:
+                        index, seq = index + 1, False
+                    elif v == 0xFFFE:
+                        seq = True
+                    elif not seq:
+                        self.map.setdefault(chr(v), index)
+        else:
+            raise ValueError("not a PSF font")
+        self.rowbytes = (self.w + 7) // 8
+        self.glyphs = data[hdr:hdr + count * self.size]
+        if not self.map:
+            self.map = {chr(i): i for i in range(min(count, 128))}
+        self.cache = {}
+
+    def bits(self, ch):
+        if ch not in self.cache:
+            i = self.map.get(ch, self.map.get("?", 0))
+            g = self.glyphs[i * self.size:(i + 1) * self.size]
+            rows = []
+            for y in range(self.h):
+                v = int.from_bytes(g[y * self.rowbytes:(y + 1) * self.rowbytes], "big")
+                rows.append([x for x in range(self.w) if v >> (self.rowbytes * 8 - 1 - x) & 1])
+            self.cache[ch] = rows
+        return self.cache[ch]
+
+
+class Kmsg:
+    """Kernel log records from /dev/kmsg (the whole ring buffer first), non-blocking."""
+
+    def __init__(self, keep, path=KMSG):
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.lines = collections.deque(maxlen=keep)
+
+    def poll(self, budget_s=0.2, max_records=5000):
+        """Read what is new, at most budget_s / max_records per call (a log flood must not stall the
+        animation or the stop checks); True if the last lines changed."""
+        new, end = False, time.monotonic() + budget_s
+        if self.fd is None:
+            return False
+        for _ in range(max_records):
+            if time.monotonic() > end:
+                return new
+            try:
+                rec = os.read(self.fd, 8192)
+            except BlockingIOError:
+                return new
+            except OSError as e:
+                if e.errno == errno.EPIPE:  # overwritten while we read: go on with the next record
+                    continue
+                print(f"i14-splash: kernel log stopped: {e}", file=sys.stderr, flush=True)
+                self.fd = None  # the animation goes on without the log
+                return new
+            if not rec:
+                return new
+            line = format_record(rec)
+            if line:
+                self.lines.append(line)
+                new = True
+        return new
+
+
+def format_record(rec):
+    """'prio,seq,usec,flags;text' -> '[   12.345678] text' without the MediaTek CPU/thread prefix."""
+    head, _, text = rec.decode("utf-8", "replace").partition(";")
+    fields = head.split(",")
+    if len(fields) < 3 or not fields[2].isdigit():
+        return ""
+    text = text.split("\n")[0].replace("\\x0d", "").replace("\\x0a", " ")  # kmsg escapes CR/LF as \xNN
+    text = MTK_PREFIX.sub("", text).strip()
+    usec = int(fields[2])
+    return f"[{usec // 1000000:5d}.{usec % 1000000:06d}] {text}" if text else ""
+
+
+def log_lines(font, height):
+    """How many text lines fit between LOG_TOP and the bottom margin."""
+    return (height - LOG_MARGIN - LOG_TOP) // font.h
+
+
+def render_log(base, width, y0, lines, font, nlines, color=LOG_COLOR, x0=LOG_MARGIN):
+    """RGBA rows y0.. of the base image with the lines drawn on it (cut to the width)."""
+    h = font.h * nlines
+    out = bytearray(base[y0 * width * 4:(y0 + h) * width * 4])
+    px = bytes(color) + b"\xff"
+    cols = (width - 2 * x0) // font.w
+    for n, line in enumerate(lines):
+        for c, ch in enumerate(line[:cols]):
+            for r, xs in enumerate(font.bits(ch)):
+                row = (n * font.h + r) * width
+                for x in xs:
+                    i = (row + x0 + c * font.w + x) * 4
+                    out[i:i + 4] = px
+    return bytes(out)
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except OSError:
+        pass
+
+
+def run(fb, anim, base, stop=STOP, clock=time.monotonic, sleep=time.sleep, limit=LIMIT_S, log=None, font=None):
+    w, h = anim["w"], anim["h"]
+    if (fb.xres, fb.yres) != (w, h):
+        raise ValueError(f"screen {fb.xres}x{fb.yres}, splash {w}x{h}")
+    fb.blit(0, 0, w, h, base)
+    fb.show()
+    n = log_lines(font, h) if font else 0
+    shown, t0, tick, drawn = state(anim, 0), clock(), 0, False
+    while not os.path.exists(stop) and clock() - t0 < limit:
+        if log and font and log.poll():
+            fb.blit(0, LOG_TOP, w, font.h * n, render_log(base, w, LOG_TOP, list(log.lines), font, n))
+            if not drawn:
+                drawn = True
+                print(time.strftime("%F %T"), f"kernel log on screen after {clock() - t0:.2f} s", flush=True)
+        now = state(anim, tick)
+        for i, name in enumerate(("cursor", "dots")):
+            if now[i] != shown[i] or tick == 0:
+                fb.blit(*anim[name]["box"], anim[name]["states"][now[i]])
+        shown = now
+        tick += 1
+        sleep(anim["tick_ms"] / 1000)
+    return tick
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    with open("/proc/uptime") as f:
+        print(time.strftime("%F %T"), f"start at kernel uptime {f.read().split()[0]} s", flush=True)
+    try:
+        anim, base = load()
+        fb = Fb()
+        write(BLANK, "0")  # on already after LK; also when started by hand
+        write(BACKLIGHT, "120")
+        try:  # the kernel log is a bonus: without font or /dev/kmsg the animation still runs
+            font = Font(FONT)
+            log = Kmsg(log_lines(font, anim["h"]))
+        except (OSError, ValueError) as e:
+            print(f"i14-splash: no kernel log on screen: {e}", file=sys.stderr)
+            log = font = None
+        run(fb, anim, base, log=log, font=font)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"i14-splash: {e}", file=sys.stderr)
+    finally:  # display off at the end, as i14-power does at boot
+        write(BACKLIGHT, "0")
+        write(BLANK, "4")
+        print(time.strftime("%F %T"), "display off, end", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+# Raw transcript whitespace is preserved; SHA256SUMS verifies exact bytes.
+evidence/**/*.txt -whitespace
+# Unified patch context preserves the upstream tabs and blank-line prefix.
+kernel/patches/*.patch -whitespace

@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+description="I14: Wi-Fi (networks from /etc/wpa_supplicant/wpa_supplicant.conf and the userdata copy)"
+command=/sbin/wpa_supplicant
+command_args="-i wlan0 -D nl80211 -c /run/i14-wpa.conf"
+supervisor=supervise-daemon  # restarted if it dies; the driver stays loaded
+respawn_delay=10
+respawn_max=0
+# Networks: /etc/wpa_supplicant/wpa_supplicant.conf and the userdata copy
+# /mnt/data/media/0/i14-linux/wpa_supplicant.conf (kept with a new rootfs.img), merged into
+# /run/i14-wpa.conf by i14-wifi-conf, which also honours the Wi-Fi-off flag of the touch interface.
+
+depend() {
+	need localmount i14-firewall
+	after bootmisc
+}
+
+start_pre() {
+	/usr/sbin/i14-wifi-up || { eerror "Wi-Fi chip did not start"; return 1; }
+	/usr/sbin/i14-wifi-conf || { eerror "could not write /run/i14-wpa.conf"; return 1; }
+}
+
+start_post() {
+	udhcpc -b -i wlan0 -p /run/i14-udhcpc-wlan0.pid -x hostname:i14 >/dev/null 2>&1
+}
+
+stop_post() {
+	[ -f /run/i14-udhcpc-wlan0.pid ] && kill "$(cat /run/i14-udhcpc-wlan0.pid)" 2>/dev/null
+	echo 0 >/dev/wmtWifi 2>/dev/null
+	return 0
+}

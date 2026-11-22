@@ -1,0 +1,17 @@
+[package]
+name = "i14-charge"
+description = "Power-off charging loop and power key watcher of the initramfs (port of charge_wait and pwrkey_watch in initramfs/i14charge)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+
+[features]
+# Host differential tests only: fake sleep (moves a fake /proc/uptime and replays a timeline),
+# fixed date, FIFOs accepted as input devices. Never enabled for the phone build.
+test-clock = []
+
+[[bin]]
+name = "i14-charge-wait"
+path = "src/main.rs"

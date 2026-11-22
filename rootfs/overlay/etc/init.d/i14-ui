@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+description="I14: touch interface (status, terminal, Wi-Fi, Bluetooth, settings); power button short: screen, hold 3 s: power off"
+command=/usr/sbin/i14-ui
+supervisor=supervise-daemon  # restarted if it dies
+respawn_delay=10
+respawn_max=0
+
+depend() {
+	after i14-power i14-wifi i14-usbnet
+}
+
+start_pre() {
+	# Take the screen over from the boot splash: stop it and wait (max 2 s) until it is gone.
+	p=$(cat /run/i14-splash.pid 2>/dev/null)
+	if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+		touch /run/i14-splash.stop
+		for i in 1 2 3 4 5 6 7 8 9 10; do
+			kill -0 "$p" 2>/dev/null || break
+			sleep 0.2
+		done
+	fi
+	return 0
+}

@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "mt6735-i14-display.dts"
+
+/ {
+    backlight {
+        compatible = "pwm-backlight";
+        /* Measured source 26 MHz, divider 1, 1024 ticks; round upward. */
+        pwms = <&disp_pwm 0 39385>;
+        brightness-levels = <0 256 512 768 1023>;
+        default-brightness-level = <4>;
+    };
+};
+
+&disp_pwm {
+    compatible = "magcomm,i14-disp-pwm", "mediatek,mt6735-disp-pwm",
+                 "mediatek,mt8173-disp-pwm";
+    status = "okay";
+    /* Preserve firmware-owned display power; the SPM provider stays disabled. */
+    /delete-property/ power-domains;
+};

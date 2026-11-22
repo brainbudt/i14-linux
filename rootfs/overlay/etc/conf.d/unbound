@@ -1,0 +1,6 @@
+# I14: run unbound in the foreground under supervise-daemon, restarted if it dies.
+rc_need="i14-firewall"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=5
+respawn_period=60

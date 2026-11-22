@@ -1,0 +1,4 @@
+auto lo
+iface lo inet loopback
+
+# USB ethernet (rndis0) is set up by i14-usbnet, Wi-Fi (wlan0) by i14-wifi.

@@ -1,0 +1,166 @@
+#!/bin/sh
+# Minute sampler for stock 3.18 / Alpine. No device writes, no current_cmd reads.
+# Keep this file on mounted userdata, for example:
+#   /mnt/data/media/0/i14-linux/soak/i14-soak-sample install
+# After a rootfs image swap run "install" again; userdata retains script and logs.
+# "uninstall" stops future cron samples, without deleting logs. No daemon to stop.
+# Rotation retains the current file and one .1 file (20 MiB each by default).
+# Copy BOTH files before rotation overwrites older history; report accepts .1 then current.
+# I14_SOAK_ROOT prefixes ALL default input paths for offline tests. Individual
+# paths below, output/lock/crontab, and command names are also overridable.
+# flock is preferred; the mkdir fallback uses volatile /run so reboot clears it.
+# After SIGKILL with that fallback, remove the EMPTY .d lock once no sampler runs.
+
+R=${I14_SOAK_ROOT:-}
+LOG=${I14_SOAK_LOG:-/mnt/data/media/0/i14-linux/soak/samples.jsonl}
+LOCK=${I14_SOAK_LOCK:-/run/i14-soak-sample.lock}
+CRON=${I14_SOAK_CRONTAB:-/etc/crontabs/root}
+MAX=${I14_SOAK_MAX_BYTES:-20971520}
+B=${I14_BATTERY:-$R/sys/class/power_supply/battery}
+BOOT=${I14_SOAK_BOOT_ID:-$R/proc/sys/kernel/random/boot_id}
+UP=${I14_SOAK_UPTIME:-$R/proc/uptime}
+LOAD=${I14_SOAK_LOADAVG:-$R/proc/loadavg}
+MEM=${I14_SOAK_MEMINFO:-$R/proc/meminfo}
+FG=${I14_FG_CURRENT:-$R/sys/devices/platform/battery_meter/FG_Current}
+FGP=${I14_FG_PERCENT:-$R/sys/devices/platform/battery_meter/FG_g_fg_dbg_percentage_fg}
+ZCV=${I14_FG_ZCV:-$R/sys/devices/platform/battery_meter/FG_g_fg_dbg_bat_zcv}
+BCCT=${I14_BCCT_CONFIG:-$R/proc/driver/thermal/clbcct}
+CSTATUS=${I14_CHARGE_STATUS:-$R/run/i14-charge-status.json}
+CMD=${I14_CURRENT_READBACK:-$R/proc/mtk_battery_cmd/battery_cmd}
+TYPE=${I14_CHARGER_TYPE:-$R/sys/devices/platform/battery/Charger_Type}
+USB=${I14_USB_ONLINE:-$R/sys/class/power_supply/usb/online}
+AC=${I14_AC_ONLINE:-$R/sys/class/power_supply/ac/online}
+LIGHT=${I14_BACKLIGHT:-$R/sys/class/leds/lcd-backlight/brightness}
+FREQ=${I14_SOAK_CPU_FREQ:-$R/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq}
+CAP=${I14_SOAK_CPU_CAP:-$R/proc/cpufreq/cpufreq_limited_max_freq_by_user}
+FIX=${I14_SOAK_CPU_FIX:-$R/proc/cpufreq/cpufreq_fix_freq_in_es}
+BLOG=${I14_SOAK_BATTERY_LOG:-$R/var/log/i14-battery.log}
+RC=${I14_SOAK_RC_SERVICE:-rc-service}
+BB=${I14_SOAK_BUSYBOX:-busybox}
+IP=${I14_SOAK_IP:-ip}
+TIMEOUT=${I14_SOAK_TIMEOUT:-timeout}
+
+case ${1:-} in
+install|uninstall)
+    line=
+    if [ "$1" = install ]; then
+        path=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0") || exit 1
+        # Cron treats % specially, even inside quotes. Use a simple persistent path.
+        case $path in *[!a-zA-Z0-9_./-]*) echo 'use a script path without spaces or special characters' >&2; exit 2;; esac
+        line="* * * * * /bin/sh '$path' # i14-soak-sample"
+    fi
+    mkdir -p "$(dirname "$CRON")" || exit 1
+    [ -e "$CRON" ] || (umask 077; : >"$CRON") || exit 1
+    tmp=$CRON.i14-soak.$$
+    trap 'rm -f "$tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    cp -p "$CRON" "$tmp" || exit 1
+    awk -v line="$line" '!/# i14-soak-sample$/ {print} END {if (line != "") print line}' \
+        "$CRON" >"$tmp" && mv "$tmp" "$CRON"
+    exit $?
+    ;;
+'') ;;
+*) echo 'usage: i14-soak-sample [install|uninstall]' >&2; exit 2;;
+esac
+
+umask 077
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK" || exit 1
+    flock -n 9 || exit 0
+else
+    mkdir "$LOCK.d" 2>/dev/null || exit 0
+    trap 'rmdir "$LOCK.d"' EXIT
+    trap 'exit 1' HUP INT TERM
+fi
+
+read_file() { cat "$1" 2>/dev/null; }
+number() {
+    printf '%s\n' "$1" | awk '{if ($0 ~ /^[+-]?[0-9]+([.][0-9]+)?$/) printf "%.10g", $0+0; else printf "null"; exit}'
+}
+string() {
+    [ -n "$1" ] || { printf null; return; }
+    printf '%s' "$1" | awk '
+        BEGIN {for (i=1; i<32; i++) esc[sprintf("%c", i)]=sprintf("\\u%04x", i); printf "\""}
+        {if (NR>1) printf "\\n"
+         for (i=1; i<=length($0); i++) {
+             c=substr($0,i,1)
+             if (c=="\\") printf "\\\\"
+             else if (c=="\"") printf "\\\""
+             else if (c in esc) printf "%s", esc[c]
+             else printf "%s", c
+         }}
+        END {printf "\""}'
+}
+field() {
+    printf '"%s":' "$1"
+    if [ "$2" = n ]; then number "$3"; else string "$3"; fi
+    printf ',\n'
+}
+
+# Capture CPU/current before the status and DNS probes wake the CPU.
+readback=$(read_file "$CMD")
+measurements=$(
+    field epoch n "$(date -u +%s)"
+    field iso s "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    field boot_id s "$(read_file "$BOOT")"
+    field uptime_seconds n "$(awk '{print $1; exit}' "$UP" 2>/dev/null)"
+    field capacity n "$(read_file "$B/capacity")"
+    field status s "$(read_file "$B/status")"
+    field batt_vol_mv n "$(read_file "$B/batt_vol")"
+    field batt_temp_deci_c n "$(read_file "$B/batt_temp")"
+    field fg_current_deci_ma n "$(read_file "$FG")"
+    field fg_percentage n "$(read_file "$FGP")"
+    field zcv_mv n "$(read_file "$ZCV")"
+    field charge_status s "$(read_file "$CSTATUS")"
+    field bcct_state s "$(read_file "$BCCT")"
+    field get_usb_current_unlimited n "$(printf '%s\n' "$readback" | sed -n 's/.*get_usb_current_unlimited=\([+-]*[0-9][0-9]*\).*/\1/p')"
+    field cmd_discharging n "$(printf '%s\n' "$readback" | sed -n 's/.*cmd_discharging[[:space:]]*=[[:space:]]*\([+-]*[0-9][0-9]*\).*/\1/p')"
+    field charger_type n "$(read_file "$TYPE")"
+    field usb_online n "$(read_file "$USB")"
+    field ac_online n "$(read_file "$AC")"
+    field backlight_brightness n "$(read_file "$LIGHT")"
+    field scaling_cur_freq_khz n "$(read_file "$FREQ")"
+    field cpufreq_limited_max_freq_by_user n "$(read_file "$CAP")"
+    field cpufreq_fix_freq_in_es n "$(read_file "$FIX")"
+    field loadavg s "$(read_file "$LOAD")"
+    field mem_available_kb n "$(awk '$1=="MemAvailable:" {print $2; exit}' "$MEM" 2>/dev/null)"
+    field wlan0_ipv4 s "$("$TIMEOUT" -s KILL 1 "$IP" -4 -o addr show dev wlan0 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="inet") {print $(i+1); exit}}')"
+)
+
+# All eight probes share one parallel round, including hung status commands.
+probes=$(
+    (
+        services=$(
+            for service in i14-power i14-cpufreq i14-ui unbound i14-wifi i14-netwatch sshd; do
+                (
+                    "$TIMEOUT" -s KILL 1 "$RC" "$service" status >/dev/null 2>&1
+                    printf '"%s":%s\n' "$service" "$?"
+                ) &
+            done
+            wait
+        )
+        printf '"services":{%s},\n' "$(printf '%s\n' "$services" | awk 'NR>1 {printf ","} {printf "%s", $0}')"
+    ) &
+    (
+        start=$(awk '{print $1}' "$UP" 2>/dev/null)
+        ok=false
+        "$TIMEOUT" -s KILL 1 "$BB" nslookup example.com 127.0.0.1 >/dev/null 2>&1 && ok=true
+        end=$(awk '{print $1}' "$UP" 2>/dev/null)
+        ms=$(awk -v a="$start" -v b="$end" 'BEGIN {if(a!="" && b!="" && b>=a) printf "%.0f", (b-a)*1000; else printf "null"}')
+        printf '"dns":{"ok":%s,"ms":%s},\n' "$ok" "$ms"
+    ) &
+    wait
+)
+last=$(tail -n 1 "$BLOG" 2>/dev/null)
+line="{$measurements
+$probes
+\"battery_log_last\":$(string "$last")}"
+# Remove formatting newlines; embedded string newlines have already been escaped.
+line=$(printf '%s' "$line" | tr -d '\n')
+mkdir -p "$(dirname "$LOG")" || exit 1
+size=0
+[ ! -f "$LOG" ] || size=$(wc -c <"$LOG") || exit 1
+if [ "$size" -ge "$MAX" ]; then mv -f "$LOG" "$LOG.1" || exit 1; fi
+# A power loss may leave a partial line. Preserve it, separating the next sample.
+if [ -s "$LOG" ] && [ -n "$(tail -c 1 "$LOG")" ]; then printf '\n' >>"$LOG" || exit 1; fi
+printf '%s\n' "$line" >>"$LOG"

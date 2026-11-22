@@ -1,0 +1,8 @@
+# I14 Linux (Alpine on the stock 3.18 kernel).
+# Start the trial watcher before OpenRC can change carried DNS state.
+::sysinit:/usr/sbin/i14-rootfs-trial start
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

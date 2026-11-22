@@ -1,0 +1,60 @@
+#!/bin/sh
+# One fresh-initramfs guard; only RO/capacity ioctls, never storage data I/O.
+set -eu
+base=/dev/mmcblk0
+expected=15634268160
+seen=
+failed=0
+ready=0
+log() {
+    printf '%s\n' "$*"
+    printf '<6>%s\n' "$*" >/dev/kmsg 2>/dev/null || :
+}
+trap 'status=$?; [ "$ready" -eq 1 ] || log "I14_STORAGE_STOPPED status=$status; no storage data actions permitted"' EXIT
+[ ! -e /run/i14-storage-ro.ready ] || { log 'I14_STORAGE_STOPPED existing receipt; refusing rerun'; exit 1; }
+protect_present() {
+    for node in /dev/mmcblk0 /dev/mmcblk0p* /dev/mmcblk0boot*; do
+        [ -b "$node" ] || continue
+        case "$node" in *rpmb*) continue ;; esac
+        case " $seen " in *" $node "*) continue ;; esac
+        seen="$seen $node"
+        if ! blockdev --setro "$node"; then
+            log "I14_STORAGE_RO_SET_FAILED $node"
+            failed=1
+        fi
+    done
+    for node in $seen; do
+        if ro=$(blockdev --getro "$node") && [ "$ro" = 1 ]; then
+            log "I14_STORAGE_RO $node ro=1"
+        else
+            log "I14_STORAGE_RO_VERIFY_FAILED $node"
+            failed=1
+        fi
+    done
+}
+log 'I14_STORAGE_RO_BEGIN expected_capacity=15634268160 (0x3a3e00000)'
+attempt=0
+while :; do
+    protect_present
+    [ "$failed" -eq 0 ] || exit 1
+    if [ -b "$base" ]; then
+        sleep 1
+        protect_present
+        break
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 10 ] || { log I14_STORAGE_TIMEOUT; exit 1; }
+    sleep 1
+done
+[ "$failed" -eq 0 ] || exit 1
+if ! capacity=$(blockdev --getsize64 "$base"); then
+    log I14_STORAGE_CAPACITY_QUERY_FAILED
+    exit 1
+fi
+[ "$capacity" = "$expected" ] || { log "I14_STORAGE_CAPACITY_MISMATCH actual=$capacity expected=$expected"; exit 1; }
+{
+    printf 'capacity_bytes=%s\n' "$expected"
+    for node in $seen; do printf '%s ro=1\n' "$node"; done
+} >/run/i14-storage-ro.ready
+ready=1
+log "I14_STORAGE_READY capacity_bytes=$capacity"

@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+description="I14: display off (saves about 120 mA while charging) and battery guard"
+command=/usr/sbin/i14-battery-guard
+supervisor=supervise-daemon  # restarted if it dies
+respawn_delay=10
+respawn_max=0
+
+start_pre() {
+	# The boot splash (sysinit) switches the display off itself when boot ends.
+	if [ -f /run/i14-splash.pid ] && kill -0 "$(cat /run/i14-splash.pid)" 2>/dev/null; then
+		einfo "boot splash running; it switches the display off at the end of boot"
+	else
+		echo 4 >/sys/class/graphics/fb0/blank 2>/dev/null || ewarn "could not switch the display off"
+	fi
+	return 0
+}

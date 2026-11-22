@@ -1,0 +1,181 @@
+#!/bin/sh
+# Rootfs trial watcher (docs/ROOTFS-SWAP-ROLLBACK.md). /i14init starts a newly swapped-in
+# rootfs.img at most TRIAL_MAX times while $DIR/rootfs-trial exists, then goes back to
+# rootfs-prev.img by itself. This script, started by inittab before OpenRC, is the "yes" half:
+#   start   with a trial marker: run "watch" in the background, return at once
+#   watch   from MIN_S seconds of uptime: when healthy AND acknowledged by the Mac, confirm
+#           (remove the marker); otherwise at DEADLINE_S: sync and reboot -f, so /i14init counts
+#           the next start (and rolls back after the last one)
+#   check   print the local health check once (exit 0 healthy, 1 not)
+#   ack     print whether the Mac's acknowledgement is valid for this trial and boot (exit 0/1)
+# Healthy: every service in $i14_trial_services started, and sshd listening on port 22.
+# Acknowledged: the watcher alone can never confirm. The marker carries ack=SHA256(NONCE); only
+# the Mac knows NONCE and writes "ack NONCE BOOT_ID" to rootfs-trial-ack over SSH (its real key,
+# strict host key: the carried host keys and authorized_keys work end to end). The ack counts only
+# when its nonce hashes to the marker's ack= value and BOOT_ID is this boot's.
+# Paths and times can be overridden for the host tests (tests/test_i14_rootfs_rollback.py).
+CONF=${I14_TRIAL_CONF:-/etc/conf.d/i14-rootfs-trial}
+i14_trial_services="sshd networking"
+[ -r "$CONF" ] && . "$CONF"
+DIR=${I14_TRIAL_DIR:-/mnt/data/media/0/i14-linux}
+M=$DIR/rootfs-trial
+ACK=$DIR/rootfs-trial-ack
+UPTIME=${I14_UPTIME:-/proc/uptime}
+BOOTID=${I14_BOOT_ID:-/proc/sys/kernel/random/boot_id}
+NET=${I14_PROC_NET:-/proc/net}
+MIN_S=${I14_TRIAL_MIN_S:-600}
+DEADLINE_S=${I14_TRIAL_DEADLINE_S:-1800}
+STEP_S=${I14_TRIAL_STEP_S:-30}
+ROOT=${I14_TRIAL_ROOT:-}
+KEY_RECEIPT=$DIR/rootfs-trial-root-key-receipt
+
+now() {
+	read -r u _ <"$UPTIME"
+	echo "${u%.*}"
+}
+
+log() {
+	echo "$(date '+%F %T') up=$(now)s $*" >>"$DIR/rootfs-trial.log" 2>/dev/null
+	logger -t i14-rootfs-trial "$*" 2>/dev/null
+	return 0
+}
+
+ssh_listening() { # a listening socket (state 0A) on local port 22 (0016), IPv4 or IPv6
+	cat "$NET/tcp" "$NET/tcp6" 2>/dev/null | grep -q -E '^ *[0-9]+: [0-9A-Fa-f]+:0016 [0-9A-Fa-f]+:[0-9A-Fa-f]+ 0A '
+}
+
+health() { # sets $bad: what is missing (empty when healthy)
+	bad=
+	for s in $i14_trial_services; do
+		rc-service "$s" status >/dev/null 2>&1 || bad="$bad $s"
+	done
+	ssh_listening || bad="$bad sshd-port-22"
+}
+
+ack_ok() { # ack_ok MARKER: the Mac's acknowledgement of this trial in this boot; else sets $ackwhy
+	case "$1" in
+	*" ack="*) want=${1##* ack=}; want=${want%% *} ;;
+	*) ackwhy="no ack= hash in the marker"; return 1 ;;
+	esac
+	[ ${#want} -eq 64 ] || { ackwhy="bad ack= hash in the marker"; return 1; }
+	[ -f "$ACK" ] || { ackwhy="no ack from the Mac"; return 1; }
+	w= nonce= b=
+	read -r w nonce b _ <"$ACK"
+	[ "$w" = ack ] && [ -n "$nonce" ] || { ackwhy="unreadable ack"; return 1; }
+	[ "$b" = "$(cat "$BOOTID")" ] || { ackwhy="ack is for another boot"; return 1; }
+	[ "$(printf %s "$nonce" | sha256sum | cut -d' ' -f1)" = "$want" ] || { ackwhy="ack is for another trial"; return 1; }
+	ackwhy=
+}
+
+marker() { # the marker's first line, empty when absent
+	m=
+	[ -f "$M" ] && read -r m <"$M"
+	echo "$m"
+}
+
+already_rolled_back() {
+	[ ! -e "$DIR/rootfs-prev.img" ] && [ -f "$DIR/rootfs-trial.img" ] &&
+		[ -f "$DIR/rootfs.img" ] && ! [ "$DIR/rootfs.img" -ef "$DIR/rootfs-trial.img" ]
+}
+
+# This runs synchronously before OpenRC: Unbound may rewrite RFC5011 state on its first probe.
+root_key_capture() {
+	boot=$(cat "$BOOTID") stamp=$(cat "$ROOT/etc/i14-rootfs-id") || return 1
+	key=$DIR/rootfs-trial-root-key.$boot
+	[ ! -e "$key" ] && (umask 077; set -C; cat "$ROOT/var/lib/unbound/root.key" >"$key") || return 1
+	got=$(sha256sum <"$key" | cut -d' ' -f1)
+	[ -n "$got" ] && [ "$got" = "$(cat "$ROOT/etc/i14-rootfs-root-key.sha256")" ] || return 1
+	printf 'root_key_boot=%s\nroot_key_stamp=%s\nroot_key_sha256=%s\n' "$boot" "$stamp" "$got" \
+		>"$KEY_RECEIPT.new" && sync && mv "$KEY_RECEIPT.new" "$KEY_RECEIPT" && sync
+}
+
+root_key_ok() {
+	boot=$(cat "$BOOTID") stamp=$(cat "$ROOT/etc/i14-rootfs-id") || return 1
+	want=$(cat "$ROOT/etc/i14-rootfs-root-key.sha256") || return 1
+	[ -n "$want" ] && [ -f "$KEY_RECEIPT" ] &&
+		grep -qxF "root_key_boot=$boot" "$KEY_RECEIPT" &&
+		grep -qxF "root_key_stamp=$stamp" "$KEY_RECEIPT" &&
+		grep -qxF "root_key_sha256=$want" "$KEY_RECEIPT" &&
+		[ "$(sha256sum <"$DIR/rootfs-trial-root-key.$boot" | cut -d' ' -f1)" = "$want" ]
+}
+
+confirm() { # confirm MARKER: record, then remove the marker (durably). Only after ack_ok.
+	printf 'confirmed %s uptime=%ss ack-boot=%s after: %s\n' "$(date '+%F %T')" "$(now)" "$(cat "$BOOTID")" "$1" \
+		>"$DIR/rootfs-trial-confirmed.new" &&
+		sync && mv "$DIR/rootfs-trial-confirmed.new" "$DIR/rootfs-trial-confirmed" && rm -f "$M" && sync &&
+		log "healthy and acknowledged by the Mac: trial confirmed ($1); rootfs-trial removed" && return 0
+	log "confirm failed: rootfs-trial left in place"
+	return 1
+}
+
+watch() {
+	lastbad=-
+	while :; do
+		m=$(marker)
+		case "$m" in
+		"trial "*) ;;
+		*)
+			log "no trial marker any more (${m:-absent}): stop watching"
+			return 0
+			;;
+		esac
+		if already_rolled_back; then
+			log "previous image restored; preserving the stale trial marker without rebooting"
+			return 0
+		fi
+		t=$(now)
+		bad=?
+		if [ "$t" -ge "$MIN_S" ]; then
+			health
+			root_key_ok || bad="$bad root-key-carry"
+			ack_ok "$m" || bad="$bad mac-ack($ackwhy)"
+			[ -z "$bad" ] && confirm "$m" && return 0  # a failed confirm keeps the deadline
+			[ "$bad" = "$lastbad" ] || log "not healthy yet, missing:$bad"
+			lastbad=$bad
+		fi
+		if [ "$t" -ge "$DEADLINE_S" ]; then
+			log "not confirmed after ${t}s (missing:$bad; $m): sync and reboot -f; /i14init counts the start"
+			sync
+			reboot -f
+			sleep 60
+			return 1
+		fi
+		sleep "$STEP_S"
+	done
+}
+
+case "$1" in
+start)
+	case "$(marker)" in
+	"trial "*)
+		already_rolled_back && exit 0
+		root_key_capture || log "root-key carry capture FAILED; confirmation refused"
+		log "trial start ($(marker)); confirm from ${MIN_S}s when healthy and acknowledged, else reboot at ${DEADLINE_S}s"
+		(watch) </dev/null >/dev/null 2>&1 &
+		;;
+	esac
+	exit 0
+	;;
+watch) watch ;;
+check)
+	health
+	if [ -z "$bad" ]; then
+		echo "healthy"
+	else
+		echo "missing:$bad"
+		exit 1
+	fi
+	;;
+ack)
+	if ack_ok "$(marker)"; then
+		echo "acknowledged"
+	else
+		echo "not acknowledged: $ackwhy"
+		exit 1
+	fi
+	;;
+*)
+	echo "usage: i14-rootfs-trial start|watch|check|ack" >&2
+	exit 2
+	;;
+esac

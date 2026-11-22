@@ -1,0 +1,297 @@
+#!/i14/bin/sh
+# First program on the stock 3.18 kernel (cmdline rdinit=/i14init). Android is removed from
+# this phone; its ramdisk still sits next to us in the boot image, but nothing starts it any more.
+#  - Power-off charging (KPOC, boot_mode 8/9): charge here and start Linux once the battery
+#    has reserve (/i14/charge). With the flag no-autoboot, or when an earlier automatic start
+#    was not confirmed: charge on, and only the power key starts Linux.
+#  - Normal boot: Linux from /sdcard/i14-linux/rootfs.img on userdata. Both file systems
+#    are checked (e2fsck -p) before they are mounted.
+#  - Flag file rescue-once next to the image (removed at once), or any failure: rescue mode,
+#    press the power key to enable authenticated USB serial login; press again to restart.
+export PATH=/i14/bin
+DIR=/i14/data/media/0/i14-linux
+STATE=$DIR/autoboot-state  # start-loop guard, see /i14/charge
+TRIAL=$DIR/rootfs-trial    # TRIAL_SIZE bytes, space-padded: "trial N ..." (N starts so far) or "rollback REASON ..."
+TRIAL_SIZE=512             # made at this size by the swap; only ever overwritten in place
+PREV=$DIR/rootfs-prev.img  # the image before the swap: where a failed trial goes back to
+NEWIMG=$DIR/rootfs-trial.img  # hard link to the image under trial; after a rollback, the failed image
+TRIAL_MAX=2                # starts of a new image before it must have confirmed itself
+trial=                     # set while this start is a trial start of the new image
+export E2FSCK_CONFIG=/i14/e2fsck.conf
+pk=  # power key watcher (charging and rescue)
+RESCUE_NOPOWER_S=600  # rescue mode: no charger this long, power off
+
+log() {
+    printf '<6>i14init: %s\n' "$*" >/dev/kmsg 2>/dev/null || :
+    echo "$*" >>/i14/i14init.log  # in RAM; readable from the rescue shell
+    [ -d $DIR ] && echo "$(date '+%F %T') $*" >>$DIR/i14init.log 2>/dev/null || :
+}
+
+rescue() {  # rescue REASON: never returns. The kernel charges meanwhile (usb_rdy). No charger for
+    # RESCUE_NOPOWER_S: power off (plugged in again, power-off charging takes over).
+    log "rescue mode ($1): press the power key for serial login"
+    [ -n "$pk" ] && kill $pk 2>/dev/null
+    rm -f "$PWRKEY"
+    login_available=0
+    if gadget; then
+        if [ -f /i14/rescue-login-enabled ]; then login_available=1; fi
+    else
+        log "rescue: usb gadget setup failed"
+    fi
+    mdev -s  # the serial port appears with the gadget
+    /i14/bin/busybox --install -s /i14/bin 2>/dev/null  # every busybox command in the shell (ps, vi, ...)
+    pwrkey_watch &
+    pk=$!
+    off=0
+    while :; do
+        sleep $STEP_S
+        if [ -e "$PWRKEY" ]; then
+            rm -f "$PWRKEY"
+            if [ "$login_available" -eq 1 ]; then
+                login_available=0
+                log "rescue: authenticated serial login enabled; power key restarts"
+                getty -l /i14/bin/login -L 115200 ttyGS0 vt100 &
+                continue
+            fi
+            log "rescue: power key: restart"
+            umount /i14/root 2>/dev/null
+            umount /i14/data 2>/dev/null
+            sync
+            reboot -f
+        fi
+        if [ "$(cat $PS/usb/online)" = 0 ] && [ "$(cat $PS/ac/online)" = 0 ]; then
+            off=$((off + STEP_S))
+        else
+            off=0  # charger, or unreadable: stay
+        fi
+        if [ $off -ge $RESCUE_NOPOWER_S ]; then
+            log "rescue: no charger for ${off}s: power off"
+            umount /i14/root 2>/dev/null
+            umount /i14/data 2>/dev/null
+            sync
+            poweroff -f
+        fi
+    done
+}
+
+partition() {  # partition() NAME -> /dev/mmcblk0pN
+    for u in /sys/block/mmcblk0/mmcblk0p*/uevent; do
+        if grep -qx "PARTNAME=$1" "$u"; then
+            d=${u%/uevent}
+            echo "/dev/${d##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+gadget() {  # USB serial console + ethernet. Enabling the gadget also sets usb_rdy, which the
+    # kernel charger waits for. Linux re-plugs it once its DHCP server runs (i14-usbnet).
+    g=/sys/class/android_usb/android0
+    printf 0 >$g/enable || return 1
+    printf 0E8D >$g/idVendor || return 1
+    printf 2007 >$g/idProduct || return 1
+    printf I14 >$g/iManufacturer
+    printf 'I14 Linux' >$g/iProduct
+    printf I14-LINUX >$g/iSerial
+    printf 1 >$g/f_acm/instances || return 1
+    printf ecm,acm >$g/functions || return 1
+    printf 1 >$g/enable
+}
+
+check() {  # check NAME DEVICE|FILE: e2fsck -p (only fixes that are safe without a human)
+    out=$(e2fsck -p "$2" 2>&1)
+    rc=$?
+    checked="e2fsck $1: rc=$rc $(echo "$out" | tail -n 3 | tr '\n' ' ')"
+    log "$checked"
+    [ $rc -lt 4 ]  # 0 clean, 1 fixed, 2 fixed (reboot only matters for a mounted root)
+}
+
+mount_data() {
+    data=$(partition userdata) || rescue "no userdata partition"
+    check userdata "$data" || rescue "userdata check failed"
+    mount -t ext4 -o noatime,nosuid,nodev "$data" /i14/data || rescue "userdata mount failed"
+    log "userdata mounted; $checked"  # the check ran before the userdata log was reachable
+}
+
+charge() {  # power-off charging; returns only through a reboot, power-off or rescue
+    mount_data
+    grep -qw i14.autoboot=test /proc/cmdline && AB_MIN_S=30 AB_HOLD_S=20
+    noauto=
+    [ -e $DIR/no-autoboot ] && noauto="no-autoboot flag"
+    [ -e $STATE ] && noauto="earlier automatic start not confirmed ($(cat $STATE))"
+    gadget || rescue "charger: usb gadget setup failed"
+    (sleep 10; display_off) &
+    pwrkey_watch &
+    pk=$!
+    if [ -n "$noauto" ]; then
+        AB_PCT=101  # no capacity reaches this: only the power key starts Linux
+        log "charger: charging; no automatic start ($noauto); the power key starts Linux"
+    else
+        log "charger: charging; Linux starts at ${AB_PCT}% and ${AB_MV}mV after ${AB_MIN_S}s, or on the power key"
+    fi
+    charge_wait
+    rc=$?
+    kill $pk 2>/dev/null
+    pk=
+    case $rc in
+    0)
+        log "charger: $why (capacity=$cap% voltage=${vol}mV): reboot into Linux"
+        state_write $STATE "handoff $(date '+%F %T')" || rescue "charger: cannot write $STATE"
+        umount /i14/data
+        sync
+        reboot -f
+        rescue "charger: reboot failed"
+        ;;
+    2)
+        log "charger: $why: power off"
+        umount /i14/data
+        sync
+        poweroff -f
+        rescue "charger: power off failed"
+        ;;
+    *) rescue "charger: $why" ;;
+    esac
+}
+
+init_ok() {  # /sbin/init must resolve to an executable inside the new root (switch_root
+    # deletes this ramdisk before it execs init, so a broken init cannot fall back).
+    t=/i14/root/sbin/init
+    if [ -L $t ]; then
+        l=$(readlink $t) || return 1
+        case "$l" in
+            /*) t=/i14/root$l ;;
+            *) t=/i14/root/sbin/$l ;;
+        esac
+    fi
+    [ -f "$t" ] && [ -x "$t" ]
+}
+
+root_ok() {  # check and mount rootfs.img, with a usable init; else set $why and return 1
+    [ -f $DIR/rootfs.img ] || { why="no rootfs.img"; return 1; }
+    check rootfs.img $DIR/rootfs.img || { why="rootfs.img check failed"; return 1; }
+    mount -t ext4 -o loop,noatime $DIR/rootfs.img /i14/root || { why="rootfs mount failed"; return 1; }
+    init_ok && return 0
+    umount /i14/root 2>/dev/null || rescue "rootfs has no usable /sbin/init and cannot unmount"
+    why="rootfs has no usable /sbin/init"
+    return 1
+}
+
+size_of() {  # size_of FILE: its size in bytes (no wc in this ramdisk)
+    set -- $(ls -ln "$1" 2>/dev/null)
+    echo "${5:--1}"
+}
+
+record() {  # record TEXT: overwrite the preallocated $TRIAL in place. Allocates nothing (no new
+    # name, no new block), so it works on a full userdata; never grows or creates the file.
+    [ -f $TRIAL ] && [ "$(size_of $TRIAL)" = $TRIAL_SIZE ] || return 1
+    printf "%-$((TRIAL_SIZE - 1)).$((TRIAL_SIZE - 1))s\n" "$1" 1<>$TRIAL && sync
+}
+
+trial_on_boot() {  # a normal start with $TRIAL: count this start of the new image, or roll back
+    [ -e $TRIAL ] || return 0
+    [ -f $TRIAL ] || rescue "rootfs-trial is not a file"
+    s=$(cat $TRIAL)
+    s=${s%"${s##*[! ]}"}  # drop the padding
+    log "rootfs trial state was: $s"
+    case "$s" in
+    rollback*) rollback "${s#rollback }"; return ;;  # an interrupted rollback: finish it
+    esac
+    if [ ! -f $PREV ]; then
+        if [ -f $NEWIMG ] && [ -f $DIR/rootfs.img ] && ! [ $DIR/rootfs.img -ef $NEWIMG ]; then
+            # rolled back in an earlier start whose record could not be written
+            log "rootfs trial: rootfs.img is not the trial image and rootfs-prev.img is gone: rolled back earlier"
+            record "rollback (record of an earlier start) ($(date '+%F %T')); was: $s" ||
+                log "rootfs trial: cannot write rootfs-trial"
+            return
+        fi
+        rescue "rootfs trial without rootfs-prev.img: no way back"
+    fi
+    sz=$(size_of $TRIAL)
+    [ "$sz" = $TRIAL_SIZE ] || { rollback "rootfs-trial has $sz bytes, not $TRIAL_SIZE"; return; }
+    [ $DIR/rootfs.img -ef $PREV ] && { rollback "rootfs.img is still rootfs-prev.img"; return; }
+    case "$s" in
+    *"
+"*) rollback "unreadable rootfs-trial"; return ;;  # one line only
+    "trial "[0-9] | "trial "[0-9]" "*) n=${s#trial }; n=${n%% *} ;;
+    *) rollback "unreadable rootfs-trial"; return ;;
+    esac
+    if [ "$n" -ge $TRIAL_MAX ]; then
+        rollback "not confirmed after $n starts"
+        return
+    fi
+    # the counter is durable before the new image is checked or started; if it cannot be
+    # written, this start goes back instead (never a start of the new image without a count)
+    record "trial $((n + 1))${s#trial [0-9]}" || { rollback "cannot count start $((n + 1))"; return; }
+    trial=$((n + 1))
+    log "rootfs trial: start $trial of $TRIAL_MAX of the new rootfs.img"
+}
+
+rollback() {  # rollback REASON: rootfs-prev.img becomes rootfs.img again by one rename onto the
+    # existing name (atomic, needs no free space); the new image stays as rootfs-trial.img. The
+    # record says "rollback" first, so a start cut off here does the same again; when the record
+    # cannot be written, the rename still happens (the next start sees prev gone, trial image not
+    # running: rolled back).
+    log "rootfs trial: $1: back to rootfs-prev.img"
+    s=$(cat $TRIAL)
+    s=${s%"${s##*[! ]}"}
+    case "$s" in
+    rollback*) ;;
+    *) record "rollback $1 ($(date '+%F %T')); was: $s" ||
+        log "rootfs trial: cannot write rootfs-trial; going back anyway" ;;
+    esac
+    if [ -f $PREV ]; then
+        if [ $DIR/rootfs.img -ef $PREV ]; then
+            rm -f $PREV  # never swapped in: rootfs.img is the previous image already
+        else
+            mv -f $PREV $DIR/rootfs.img || rescue "rollback: cannot rename rootfs-prev.img"
+        fi
+        sync
+    fi
+    [ -f $DIR/rootfs.img ] || rescue "rollback: no rootfs.img"
+    trial=
+    log "rootfs trial: rolled back; the new image stays as rootfs-trial.img"
+}
+
+. /i14/charge  # definitions only (rescue needs them too)
+mount -t proc proc /proc || rescue proc
+mount -t sysfs sysfs /sys || rescue sysfs
+mount -t tmpfs -o mode=0755 tmpfs /dev || rescue dev
+mdev -s
+mode=$(cat /sys/class/BOOT/BOOT/boot/boot_mode 2>/dev/null)
+log "boot_mode=$mode"
+
+grep -q 'androidboot.mode=charger' /proc/cmdline && charge
+case "$mode" in
+    0|3) ;;  # normal boot, software reboot
+    8|9) charge ;;  # power-off charging (9: battery low)
+    *) rescue "boot_mode=$mode" ;;
+esac
+
+mount_data
+state_on_boot $STATE || rescue "cannot update $STATE"
+if [ -e $DIR/rescue-once ]; then
+    rm -f $DIR/rescue-once
+    sync
+    rescue "rescue-once flag"
+fi
+trial_on_boot
+if ! root_ok; then
+    [ -n "$trial" ] || rescue "$why"
+    rollback "trial start $trial: $why"
+    root_ok || rescue "$why"
+fi
+
+gadget || rescue "usb gadget setup failed"
+log "starting Linux"  # last line that reaches the userdata log (it moves next)
+moved=
+for m in /i14/data:/mnt/data /dev:/dev /sys:/sys /proc:/proc; do
+    src=${m%%:*} dst=/i14/root${m#*:}
+    if mkdir -p $dst && mount --move $src $dst; then
+        moved="$src:$dst $moved"
+    else
+        for b in $moved; do mount --move ${b#*:} ${b%%:*}; done
+        rescue "moving $src failed"
+    fi
+done
+exec switch_root /i14/root /sbin/init

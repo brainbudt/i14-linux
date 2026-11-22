@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Measured own-LK OVL layer 3; preserve its existing video-mode scanout. */
+#include "mt6735-i14-bringup.dts"
+
+/ {
+    chosen {
+        linux,initrd-end = <0 0x4404bb41>;
+        bootargs = "console=tty0 console=ttyS0,921600n8 root=/dev/ram rdinit=/init ignore_loglevel loglevel=8 nokaslr panic=10 clk_ignore_unused pd_ignore_unused regulator_ignore_unused consoleblank=0";
+        zimage64,cmdline-override = "console=tty0 console=ttyS0,921600n8 root=/dev/ram rdinit=/init ignore_loglevel loglevel=8 nokaslr panic=10 clk_ignore_unused pd_ignore_unused regulator_ignore_unused consoleblank=0";
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+
+        framebuffer@bf48e000 {
+            compatible = "simple-framebuffer";
+            reg = <0 0xbf48e000 0 0x00465000>;
+            width = <720>;
+            height = <1600>;
+            stride = <2880>;
+            format = "a8r8g8b8";
+            status = "okay";
+        };
+    };
+
+    reserved-memory {
+        framebuffer@bf010000 {
+            reg = <0 0xbf010000 0 0x00fb0000>;
+            no-map;
+        };
+    };
+};
+
+/* Own stock DT bus/IRQ; own driver overrides its placeholder address to 0x38. */
+&i2c1 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    touchscreen@38 {
+        compatible = "magcomm,i14-focaltech-8632", "edt,edt-ft5406";
+        reg = <0x38>;
+        interrupt-parent = <&pio>;
+        interrupts = <10 IRQ_TYPE_EDGE_FALLING>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&i14_touch_irq>;
+        touchscreen-size-x = <720>;
+        touchscreen-size-y = <1600>;
+        /* Retain working firmware/power/reset state; no guessed supplies. */
+    };
+};
+
+&pio {
+    i14_touch_irq: i14-touch-irq-pins {
+        pins {
+            pinmux = <PINMUX_GPIO10__FUNC_GPIO10>;
+            input-enable;
+            bias-disable;
+        };
+    };
+};

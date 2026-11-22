@@ -1,0 +1,5 @@
+# Cross-build for the phone from macOS: static musl binary, linked by the
+# rust-lld that ships with the toolchain (no external C toolchain needed).
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]

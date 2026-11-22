@@ -1,0 +1,10 @@
+#!/bin/sh
+# Confirm an automatic start from power-off charging (/i14init, docs/AUTOBOOT-2026-11-04.md): after
+# 10 minutes of running Linux the state file goes, and the next power-off charging may start Linux
+# by itself again. Left in place (Linux died sooner), the next power-off charging waits for a human.
+S=${I14_AUTOBOOT_STATE:-/mnt/data/media/0/i14-linux/autoboot-state}
+[ -e "$S" ] || exit 0
+(
+	sleep "${I14_AUTOBOOT_ACK_S:-600}"
+	rm -f "$S" && sync && logger -t i14-autoboot "start confirmed after 10 minutes; $S removed"
+) </dev/null >/dev/null 2>&1 &

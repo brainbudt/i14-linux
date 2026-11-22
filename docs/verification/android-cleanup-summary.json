@@ -1,0 +1,15 @@
+{
+  "removed_packages_total": 42,
+  "disabled_google_packages": [
+    "com.google.android.gms",
+    "com.google.android.gsf.login",
+    "com.google.android.gsf"
+  ],
+  "after_reboot_verified": true,
+  "termux_shell_verified": true,
+  "fatal_exception_count": 0,
+  "full_linux_distribution_installed": false,
+  "source_description": "Local Android cleanup result captured on 2026-10-30; selected fields only.",
+  "classification_limit": "Removal does not prove malware; no forensic malware verdict is recorded.",
+  "source_sha256": "43609c3e225fc20fb5a1020b37b3e8bfb8c1a0fef7328fece64498d95cfcfbe5"
+}

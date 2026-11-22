@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/dts-v1/;
+
+#include "mt6735.dtsi"
+
+/ {
+	model = "I14 MT6735 initramfs bring-up";
+	compatible = "magcomm,magc6735-65u-1-m0", "mediatek,mt6735";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		/* LK may expand /memory/reg; cap the range again inside Linux. */
+		linux,usable-memory-range = <0 0x40000000 0 0x40000000>;
+		linux,initrd-start = <0 0x44000000>;
+		linux,initrd-end = <0 0x44038e53>;
+		stdout-path = "serial0:921600n8";
+		bootargs = "console=tty0 console=ttyS0,921600n8 root=/dev/ram rdinit=/init ignore_loglevel loglevel=8 nokaslr panic=10 clk_ignore_unused pd_ignore_unused regulator_ignore_unused";
+		/* LK can replace bootargs; zimage64 restores this explicit value. */
+		zimage64,cmdline-override = "console=tty0 console=ttyS0,921600n8 root=/dev/ram rdinit=/init ignore_loglevel loglevel=8 nokaslr panic=10 clk_ignore_unused pd_ignore_unused regulator_ignore_unused";
+	};
+
+	/* Keep the second bank, modem, connectivity, TEE and framebuffer out. */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0 0x40000000>;
+	};
+
+	reserved-memory {
+		/* ATF at 0x43000000/0x30000 is inherited and matches the own DT. */
+		/* Keep the vendor ramconsole and minirdump passive. */
+		memory@43f00000 {
+			reg = <0 0x43f00000 0 0x10000>;
+			no-map;
+		};
+
+		ramoops@43f10000 {
+			compatible = "ramoops";
+			reg = <0 0x43f10000 0 0xe0000>;
+			no-map;
+			/* Layout matches the own stock kernel's parameter defaults. */
+			record-size = <0x1000>;
+			console-size = <0x10000>;
+			ftrace-size = <0x1000>;
+			pmsg-size = <0x10000>;
+			ecc-size = <0>;
+			mem-type = <0>;
+			flags = <0>;
+		};
+
+		memory@43ff0000 {
+			reg = <0 0x43ff0000 0 0x10000>;
+			no-map;
+		};
+
+		/* Conservative first-bank firmware ceiling, including dummy-read. */
+		memory@78000000 {
+			reg = <0 0x78000000 0 0x08000000>;
+			no-map;
+		};
+
+		/delete-node/ memory@7e000000;
+		/delete-node/ memory@7f800000;
+	};
+};
+
+/* Match the reference single-core path until PSCI is separately verified. */
+/delete-node/ &cpu1;
+/delete-node/ &cpu2;
+/delete-node/ &cpu3;
+
+&uart0 {
+	status = "okay";
+};
+
+&usb2 {
+	status = "okay";
+	dr_mode = "peripheral";
+};
+
+&usb2phy {
+	status = "okay";
+};
+
+/* Wrapper/MFD probe can write transport controls, IRQ masks and rail controls. */
+&pwrap {
+	status = "okay";
+
+	pmic6328: pmic {
+		compatible = "mediatek,mt6328";
+		interrupt-parent = <&pio>;
+		interrupts = <206 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		/* Constrain only the two rails reported by the own Android driver. */
+		regulators {
+			compatible = "mediatek,mt6328-regulator";
+
+			mt6328_vemc33_reg: ldo_vemc_3v3 {
+				regulator-name = "vemc_3v3";
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			mt6328_vio18_reg: ldo_vio18 {
+				regulator-name = "vio18";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+		};
+
+		keys {
+			compatible = "mediatek,mt6328-keys";
+			status = "disabled";
+		};
+	};
+};
+
+&mmc0 {
+	status = "okay";
+	bus-width = <1>;
+	max-frequency = <400000>;
+	non-removable;
+	no-sd;
+	no-sdio;
+	vmmc-supply = <&mt6328_vemc33_reg>;
+	vqmmc-supply = <&mt6328_vio18_reg>;
+};
+
+&mmc1 {
+	status = "disabled";
+};
+
+&mmc2 {
+	status = "disabled";
+};
+
+/* Avoid bringing up unrelated display/multimedia power-domain consumers. */
+&scpsys {
+	status = "disabled";
+};
+
+&spm {
+	status = "disabled";
+};
+
+&m4u {
+	status = "disabled";
+};
+
+&smi_common {
+	status = "disabled";
+};
+
+&smi_larb0 {
+	status = "disabled";
+};
+
+&smi_larb1 {
+	status = "disabled";
+};
+
+&smi_larb2 {
+	status = "disabled";
+};
+
+&smi_larb3 {
+	status = "disabled";
+};

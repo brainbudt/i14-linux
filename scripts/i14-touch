@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Temporary uinput tap injector for host-driven I14 UI tests (e.g. scripts/i14-bt-pair-test.py).
+
+Not part of the rootfs image. The operator copies it to /run/i14-touch (tmpfs: a reboot removes
+it), runs it as root on the phone's stock 3.18.19 kernel and restarts i14-ui once after `start`:
+the UI enumerates touch screens only at startup (only keyboards are hotplug-scanned).
+
+  start [--lifetime S] [--idle S]  create the device "I14 test tap injector" and detach a daemon
+                                   that listens on /run/i14-touch.sock (0600); exit 0 once ready
+  tap X Y                          one tap at screen pixel X,Y (0<=X<720, 0<=Y<1600); exit 0 on ack
+  status                           exit 0 if the daemon runs (prints pid, age, taps)
+  stop                             destroy the device and remove the socket (idempotent)
+  pin-gate                         read-only: exit 0 only if the UI has no PIN (prints no PIN data)
+
+Lifecycle: `start` and `stop` serialise on /run/i14-touch.lock (never removed), so a stop waits
+for a start in progress and two starts cannot race. The daemon holds a lock on
+/run/i14-touch.pid (never removed; holds its pid while it lives) for its whole life: that lock,
+not the file's existence, says whether a daemon runs.
+
+The daemon destroys the device and exits on SIGTERM/SIGINT/SIGHUP, after --idle seconds without a
+tap (default 3600), after --lifetime seconds (default and maximum 10800 = 3 h) and on any failed
+event write (so a finger is never left down). The kernel also destroys a uinput device when its
+file is closed, so even a killed daemon leaves no device behind.
+
+Device modelled on artifacts/i14-bcct-touch.py: multitouch protocol B, ABS_MT_POSITION_X 0..719
+and ABS_MT_POSITION_Y 0..1599 (screen pixels 1:1: both UIs use raw values, no scaling), plus
+BTN_TOUCH and ABS_X/ABS_Y. input_event is the arm64 layout (Alpine aarch64): 2 x int64 time,
+u16 type, u16 code, s32 value = 24 bytes.
+"""
+import contextlib
+import errno
+import fcntl
+import json
+import math
+import os
+import platform
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+
+KERNEL = "3.18.19"
+MACHINE = "aarch64"
+WIDTH, HEIGHT = 720, 1600
+NAME = b"I14 test tap injector"
+UINPUT = "/dev/uinput"
+SOCK = "/run/i14-touch.sock"
+PIDFILE = "/run/i14-touch.pid"
+LOCKFILE = "/run/i14-touch.lock"
+LOGFILE = "/run/i14-touch.log"
+SETTINGS = "/mnt/data/media/0/i14-linux/ui.json"  # i14-config PATH: holds the UI PIN
+
+MAX_LIFETIME = 3 * 3600
+DEFAULT_IDLE = 3600
+HOLD = 0.12           # finger down time
+SETTLE = 0.10         # pause after the lift, before the ack
+MIN_INTERVAL = 0.25   # rate limit: a tap starts at least this long after the previous one ended
+MAX_PER_MINUTE = 30   # rate limit: taps in any 60 s window (more are refused)
+REQ_MAX = 32          # bytes of one request line
+REQUEST_TIMEOUT = 2.0  # daemon: whole request must arrive within this
+CLIENT_TIMEOUT = 5.0   # client: whole exchange must finish within this
+READY_TIMEOUT = 10.0   # start: daemon must report ready within this
+LIFECYCLE_WAIT = 20.0  # start/stop: wait this long for another start/stop to finish
+EXIT_WAIT = 5.0        # stop: SIGTERM grace before SIGKILL
+
+# linux/uinput.h, linux/input-event-codes.h (generic _IOW/_IO encoding, same on arm and arm64)
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+UI_SET_ABSBIT = 0x40045567
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+SYN_REPORT = 0
+BTN_TOUCH = 330
+ABS_X, ABS_Y = 0x00, 0x01
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
+BUS_VIRTUAL = 0x06
+ABS_CNT = 64
+ABS_MAX = {ABS_X: WIDTH - 1, ABS_Y: HEIGHT - 1, ABS_MT_SLOT: 9,
+           ABS_MT_POSITION_X: WIDTH - 1, ABS_MT_POSITION_Y: HEIGHT - 1, ABS_MT_TRACKING_ID: 65535}
+EVENT = struct.Struct("<qqHHi")  # struct input_event on arm64 (little endian), 24 bytes
+REQUEST = re.compile(rb"tap (0|[1-9][0-9]{0,3}) (0|[1-9][0-9]{0,3})\n")
+
+
+class Refused(Exception):
+    """A request or an environment the helper does not accept."""
+
+
+class DeviceLost(Exception):
+    """An event write failed: the device has been destroyed; the daemon must exit."""
+
+
+# --- pure parts (unit-tested) ---------------------------------------------------------------
+
+def check_xy(x, y):
+    if type(x) is not int or type(y) is not int or not (0 <= x < WIDTH and 0 <= y < HEIGHT):
+        raise Refused(f"out of bounds: need 0<=x<{WIDTH} and 0<=y<{HEIGHT}")
+    return x, y
+
+
+def parse_xy(sx, sy):
+    """Command-line X Y: plain decimal integers only."""
+    if not (re.fullmatch(r"0|[1-9][0-9]{0,3}", sx) and re.fullmatch(r"0|[1-9][0-9]{0,3}", sy)):
+        raise Refused("X and Y must be plain decimal integers")
+    return check_xy(int(sx), int(sy))
+
+
+def parse_request(data):
+    """b'tap X Y\\n' -> (x, y); anything else raises Refused."""
+    if not isinstance(data, bytes) or len(data) > REQ_MAX:
+        raise Refused("bad request")
+    m = REQUEST.fullmatch(data)
+    if not m:
+        raise Refused("bad request")
+    return check_xy(int(m.group(1)), int(m.group(2)))
+
+
+def descriptor():
+    """struct uinput_user_dev (legacy write setup, kernel 3.18): 1116 bytes."""
+    absmax = [0] * ABS_CNT
+    for axis, value in ABS_MAX.items():
+        absmax[axis] = value
+    head = struct.pack("<80sHHHHI", NAME, BUS_VIRTUAL, 0x1234, 0x5678, 1, 0)
+    return head + struct.pack(f"<{ABS_CNT}i", *absmax) + bytes(ABS_CNT * 4 * 3)
+
+
+def pack(events):
+    return b"".join(EVENT.pack(0, 0, t, c, v) for t, c, v in events)
+
+
+def tap_events(x, y, tracking_id):
+    """(down, up) event bytes for one protocol-B tap in slot 0."""
+    check_xy(x, y)
+    down = [(EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, tracking_id),
+            (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y),
+            (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y),
+            (EV_KEY, BTN_TOUCH, 1), (EV_SYN, SYN_REPORT, 0)]
+    up = [(EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+          (EV_KEY, BTN_TOUCH, 0), (EV_SYN, SYN_REPORT, 0)]
+    return pack(down), pack(up)
+
+
+class RateLimit:
+    """At most MAX_PER_MINUTE taps per 60 s (refused beyond), MIN_INTERVAL between taps (waited)."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.stamps = []
+        self.last_end = None
+
+    def delay(self):
+        """Seconds to wait before the next tap; raises Refused if the minute budget is spent."""
+        now = self.clock()
+        self.stamps = [t for t in self.stamps if now - t < 60]
+        if len(self.stamps) >= MAX_PER_MINUTE:
+            raise Refused(f"rate limit: {MAX_PER_MINUTE} taps per minute")
+        if self.last_end is None:
+            return 0.0
+        return min(MIN_INTERVAL, max(0.0, MIN_INTERVAL - (now - self.last_end)))
+
+    def started(self):
+        self.stamps.append(self.clock())
+
+    def done(self):
+        self.last_end = self.clock()
+
+
+# --- environment ----------------------------------------------------------------------------
+
+def require_root_and_kernel():
+    if os.geteuid() != 0:
+        raise Refused("must run as root")
+    if os.uname().release != KERNEL:
+        raise Refused(f"kernel {os.uname().release} is not {KERNEL}")
+
+
+def write_all(fd, data):
+    n = os.write(fd, data)
+    if n != len(data):
+        raise OSError(errno.EIO, f"short write {n}/{len(data)}")
+
+
+class Device:
+    """The uinput device; destroy() is safe to call more than once."""
+
+    def __init__(self):
+        self.fd = None
+        self.created = False
+        self.tracking_id = 0
+
+    def create(self):
+        self.fd = os.open(UINPUT, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            for ev in (EV_SYN, EV_KEY, EV_ABS):
+                fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, BTN_TOUCH)
+            for axis in sorted(ABS_MAX):
+                fcntl.ioctl(self.fd, UI_SET_ABSBIT, axis)
+            write_all(self.fd, descriptor())
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+            self.created = True
+        except BaseException:
+            self.destroy()
+            raise
+
+    def _lose(self, what, err, up=None):
+        """A write failed: try one lift (best effort), then destroy the device, then raise."""
+        if up is not None:
+            try:
+                os.write(self.fd, up)
+            except OSError:
+                pass
+        self.destroy()  # also removes any contact the UI still holds for this device
+        raise DeviceLost(f"{what} write failed: {err}")
+
+    def tap(self, x, y, sleep=time.sleep):
+        check_xy(x, y)
+        if not self.created:
+            raise DeviceLost("no device")
+        self.tracking_id = self.tracking_id % 65535 + 1
+        down, up = tap_events(x, y, self.tracking_id)
+        try:
+            write_all(self.fd, down)
+        except OSError as e:
+            self._lose("touch", e, up)
+        try:
+            sleep(HOLD)
+        finally:
+            try:
+                write_all(self.fd, up)  # never leave a finger down
+            except OSError as e:
+                self._lose("lift", e)
+        sleep(SETTLE)
+
+    def destroy(self):
+        fd, self.fd = self.fd, None
+        if fd is None:
+            return
+        try:
+            if self.created:
+                fcntl.ioctl(fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        finally:
+            self.created = False
+            os.close(fd)  # closing /dev/uinput destroys the device as well
+
+
+def read_pid():
+    try:
+        with open(PIDFILE) as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    return int(text) if re.fullmatch(r"[1-9][0-9]{0,9}", text) else None
+
+
+def is_ours(pid):
+    """True if pid is a running i14-touch daemon."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return False
+    return any(a.endswith(b"i14-touch") for a in argv) and b"_daemon" in argv
+
+
+def alive():
+    """True if a daemon holds the pid file's lock (it does from before setup until it exits)."""
+    try:
+        fd = os.open(PIDFILE, os.O_RDONLY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return True
+        raise
+    finally:
+        os.close(fd)
+    return False
+
+
+@contextlib.contextmanager
+def lifecycle(wait=None):
+    """Serialises start and stop on LOCKFILE, which is never removed."""
+    wait = LIFECYCLE_WAIT if wait is None else wait
+    fd = os.open(LOCKFILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        end = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.monotonic() >= end:
+                    raise Refused("another start/stop is in progress")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def remove_socket():
+    try:
+        os.unlink(SOCK)
+    except FileNotFoundError:
+        pass
+
+
+def log(msg):
+    try:
+        fd = os.open(LOGFILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            os.write(fd, f"{stamp} {msg}\n".encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+# --- PIN gate (mirrors rust/crates/i14-config Config::load + has_pin) -----------------------
+
+def _strict_json(raw):
+    """Parses like serde_json into a Value, or raises ValueError. Where unsure it rejects (a
+    rejection only defers the test): non-finite numbers, lone surrogates, duplicate keys, deep
+    nesting."""
+    text = raw.decode("utf-8")  # strict, like from_utf8; a BOM is then rejected by the parser
+
+    def constant(name):
+        raise ValueError("non-finite number")
+
+    def number(text_value, conv):
+        v = conv(text_value)
+        try:
+            ok = math.isfinite(float(v))
+        except OverflowError:
+            ok = False
+        if not ok:
+            raise ValueError("number out of range")
+        return v
+
+    def pairs(items):
+        keys = [k for k, _ in items]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate key")
+        return dict(items)
+
+    value = json.loads(text, parse_constant=constant, parse_int=lambda t: number(t, int),
+                       parse_float=lambda t: number(t, float), object_pairs_hook=pairs)
+
+    def walk(v, depth):
+        if depth > 32:
+            raise ValueError("nesting too deep")
+        if isinstance(v, str):
+            if any(0xD800 <= ord(c) <= 0xDFFF for c in v):
+                raise ValueError("lone surrogate")
+        elif isinstance(v, list):
+            for item in v:
+                walk(item, depth + 1)
+        elif isinstance(v, dict):
+            for k, item in v.items():
+                walk(k, depth + 1)
+                walk(item, depth + 1)
+
+    walk(value, 0)
+    return value
+
+
+def pin_gate(path=None):
+    """(ok, message): ok only if the Rust UI would load the settings without a PIN.
+
+    Config::load: missing file = defaults (no PIN); unreadable, non-UTF-8, non-JSON, not an
+    object or a bad "pin" entry = damaged, and has_pin() is true for damaged. Any "pin" other than
+    null is a PIN or damaged. Other fields never make the file damaged. The message never contains
+    file content."""
+    path = SETTINGS if path is None else path
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return True, "no settings file: no PIN"
+    except OSError as e:
+        return False, (f"settings file unreadable ({errno.errorcode.get(e.errno, e.errno)}): "
+                       "the UI treats it as PIN-protected")
+    try:
+        cfg = _strict_json(raw)
+    except (ValueError, RecursionError) as e:
+        return False, (f"settings file damaged ({type(e).__name__}): "
+                       "the UI treats it as PIN-protected")
+    if not isinstance(cfg, dict):
+        return False, "settings file is not a JSON object: the UI treats it as PIN-protected"
+    if cfg.get("pin") is not None:
+        return False, "a PIN is configured"
+    return True, "no PIN configured"
+
+
+def cmd_pin_gate():
+    ok, msg = pin_gate()
+    print(("OK: " if ok else "STOP: ") + msg)
+    return 0 if ok else 1
+
+
+# --- daemon ---------------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self, lifetime, idle, device=None, clock=time.monotonic, sleep=time.sleep):
+        self.lifetime, self.idle = lifetime, idle
+        self.device = device or Device()
+        self.clock, self.sleep = clock, sleep
+        self.rate = RateLimit(clock)
+        self.stop = False
+        self.fatal = None
+        self.taps = 0
+        self.sock = None
+        self.started = clock()
+        self.last = self.started
+
+    def _signal(self, signum, frame):
+        self.stop = True
+
+    def setup(self):
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s, self._signal)
+        self.device.create()
+        remove_socket()
+        old = os.umask(0o077)
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.bind(SOCK)
+        finally:
+            os.umask(old)
+        os.chmod(SOCK, 0o600)
+        self.sock.listen(4)
+        self.sock.settimeout(1.0)
+
+    def expired(self):
+        now = self.clock()
+        if now - self.started >= self.lifetime:
+            return "lifetime"
+        if now - self.last >= self.idle:
+            return "idle"
+        return None
+
+    def closing(self):
+        """Why no tap may be injected now, or None."""
+        if self.fatal:
+            return f"device lost: {self.fatal}"
+        if self.stop:
+            return "signal"
+        return self.expired()
+
+    def handle(self, request):
+        """One request line -> reply bytes."""
+        if request == b"ping\n":
+            age = int(self.clock() - self.started)
+            return f"pong pid={os.getpid()} age={age}s taps={self.taps}\n".encode()
+        try:
+            x, y = parse_request(request)
+            wait = self.rate.delay()
+            if wait:
+                self.sleep(wait)
+            reason = self.closing()  # re-checked right before the injection
+            if reason:
+                raise Refused(f"daemon is stopping ({reason})")
+            self.rate.started()
+            try:
+                self.device.tap(x, y)
+            finally:
+                self.rate.done()
+        except Refused as e:
+            log(f"refused {request[:REQ_MAX]!r}: {e}")
+            return f"err {e}\n".encode()
+        except DeviceLost as e:
+            self.fatal = str(e)
+            self.stop = True
+            log(f"fatal: {e}")
+            return f"err {e}; device destroyed, daemon exits\n".encode()
+        self.taps += 1
+        self.last = self.clock()
+        log(f"tap {x} {y}")
+        return b"ok\n"
+
+    def serve_one(self, conn):
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        data = b""
+        try:
+            while not data.endswith(b"\n") and len(data) <= REQ_MAX:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise socket.timeout
+                conn.settimeout(left)
+                chunk = conn.recv(REQ_MAX + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            reply = self.handle(data)
+        except socket.timeout:
+            log("refused: request timeout")
+            reply = b"err request timeout\n"
+        except OSError:
+            conn.close()
+            return
+        try:
+            conn.settimeout(1.0)
+            conn.sendall(reply)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def run(self):
+        while True:
+            reason = self.closing()
+            if reason:
+                return reason
+            try:
+                conn, _ = self.sock.accept()
+            except (socket.timeout, InterruptedError):
+                continue
+            self.serve_one(conn)
+
+    def close(self):
+        try:
+            self.device.destroy()
+        finally:
+            if self.sock is not None:
+                self.sock.close()
+            remove_socket()
+
+
+def daemon_main(lifetime, idle, ready_fd):
+    """Runs in the detached grandchild; reports b'ok' or b'err ...' on ready_fd."""
+    lock_fd = os.open(PIDFILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.write(ready_fd, b"err already running")
+        os._exit(1)
+    os.ftruncate(lock_fd, 0)
+    os.write(lock_fd, f"{os.getpid()}\n".encode())  # before setup: a failed start can kill us
+    d = None
+    try:
+        d = Daemon(lifetime, idle)
+        d.setup()
+        log(f"started pid={os.getpid()} lifetime={lifetime}s idle={idle}s")
+        os.write(ready_fd, b"ok")
+        os.close(ready_fd)
+        ready_fd = None
+        log(f"stopping: {d.run()}")
+    except BaseException as e:
+        if ready_fd is not None:
+            try:
+                os.write(ready_fd, f"err {e}".encode()[:200])
+            except OSError:
+                pass
+        log(f"error: {e}")
+    finally:
+        try:
+            if d is not None:
+                d.close()
+            else:
+                remove_socket()
+        finally:
+            os.ftruncate(lock_fd, 0)
+            os.close(lock_fd)  # releases the lock last: `alive()` stays true until cleaned up
+    os._exit(0)
+
+
+# --- commands -------------------------------------------------------------------------------
+
+def spawn(lifetime, idle):
+    """Forks the detached daemon; returns what it reported (b'ok' when ready)."""
+    rfd, wfd = os.pipe()
+    if os.fork() == 0:  # child
+        try:
+            os.close(rfd)
+            os.setsid()
+            if os.fork() != 0:
+                os._exit(0)
+            os.chdir("/")
+            null = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            os.set_inheritable(wfd, True)
+            # a fresh interpreter: /proc/PID/cmdline then names the daemon (see is_ours)
+            os.execv(sys.executable, [sys.executable, "-B", os.path.abspath(__file__), "_daemon",
+                                      str(lifetime), str(idle), str(wfd)])
+        finally:
+            os._exit(1)
+    os.close(wfd)
+    os.wait()
+    result = b""
+    end = time.monotonic() + READY_TIMEOUT
+    try:
+        while time.monotonic() < end:
+            ready, _, _ = select.select([rfd], [], [], max(0.0, end - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(rfd, 256)
+            if not chunk:
+                break
+            result += chunk
+    finally:
+        os.close(rfd)
+    return result
+
+
+def wait_dead(timeout):
+    end = time.monotonic() + timeout
+    while alive():
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def proc_start(pid):
+    """Start time of pid (field 22 of /proc/PID/stat, clock ticks since boot), or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    try:  # comm (field 2) may hold spaces and parens: fields 3.. follow the last ')'
+        return int(data[data.rindex(b")") + 2:].split()[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def identity(pid):
+    """(pid, start time) of a running i14-touch daemon, or None."""
+    start = proc_start(pid)
+    return (pid, start) if start is not None and is_ours(pid) else None
+
+
+def send(pid, sig):
+    """Signals pid; False if it has already exited (ESRCH)."""
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def kill_daemon():
+    """Stops the running daemon (caller holds the lifecycle lock). Returns True if one ran."""
+    if not alive():
+        return False
+    pid = None
+    end = time.monotonic() + 1.0
+    while pid is None and time.monotonic() < end:  # it writes its pid right after locking
+        pid = read_pid()
+        if pid is None:
+            time.sleep(0.05)
+    first = identity(pid) if pid else None
+    if first is None:
+        raise Refused(f"pid file locked but holder {pid} is not an i14-touch daemon; not killed")
+    send(pid, signal.SIGTERM)
+    if wait_dead(EXIT_WAIT):
+        return True
+    # escalate only against the very process checked above: same lock holder, pid and start time
+    if not alive():
+        return True
+    if read_pid() != pid or identity(pid) != first:
+        raise Refused(f"pid {pid} is no longer the daemon that got SIGTERM; not escalating")
+    send(pid, signal.SIGKILL)  # the kernel destroys the device when its fd closes
+    if not wait_dead(2.0):
+        raise Refused(f"pid {pid} did not exit")
+    return True
+
+
+def cmd_start(lifetime, idle):
+    require_root_and_kernel()
+    if platform.machine() != MACHINE:
+        raise Refused(f"machine {platform.machine()} is not {MACHINE} (input_event layout)")
+    if not 60 <= lifetime <= MAX_LIFETIME:
+        raise Refused(f"--lifetime must be 60..{MAX_LIFETIME}")
+    if not 60 <= idle <= MAX_LIFETIME:
+        raise Refused(f"--idle must be 60..{MAX_LIFETIME}")
+    with lifecycle():
+        if alive():
+            raise Refused(f"already running (pid {read_pid()}); use stop first")
+        remove_socket()  # stale leftover of a dead daemon
+        result = spawn(lifetime, idle)
+        if result != b"ok":
+            try:
+                if result != b"err already running":  # never another daemon's process
+                    kill_daemon()  # a daemon that did not report ready must not live on
+            except Refused as e:
+                log(f"start cleanup: {e}")
+            raise Refused(f"daemon did not start: {result.decode(errors='replace') or 'no answer'}")
+        pid = read_pid()
+    print(f"started: device {NAME.decode()!r}, socket {SOCK}, pid {pid}; "
+          f"now restart i14-ui so it opens the device")
+    return 0
+
+
+def request(line, timeout=CLIENT_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    def left():
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            raise socket.timeout("timed out")
+        return rest
+
+    try:
+        s.settimeout(left())
+        s.connect(SOCK)
+        s.sendall(line)
+        reply = b""
+        while not reply.endswith(b"\n") and len(reply) < 256:
+            s.settimeout(left())
+            chunk = s.recv(256)
+            if not chunk:
+                break
+            reply += chunk
+        return reply.decode(errors="replace").strip()
+    finally:
+        s.close()
+
+
+def cmd_tap(sx, sy):
+    require_root_and_kernel()
+    x, y = parse_xy(sx, sy)
+    try:
+        reply = request(f"tap {x} {y}\n".encode())
+    except OSError as e:
+        raise Refused(f"no daemon answer ({e}); run start first")
+    if reply != "ok":
+        raise Refused(reply or "empty reply")
+    return 0
+
+
+def cmd_status():
+    require_root_and_kernel()
+    if not alive():
+        print("not running")
+        return 1
+    try:
+        print(request(b"ping\n"))
+    except OSError as e:
+        print(f"pid {read_pid()} runs but does not answer: {e}")
+        return 1
+    return 0
+
+
+def cmd_stop():
+    require_root_and_kernel()
+    with lifecycle():  # waits for a start in progress
+        ran = kill_daemon()
+        remove_socket()
+    print("stopped" if ran else "not running")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        if argv[:1] == ["_daemon"]:
+            if len(argv) != 4 or not all(re.fullmatch(r"[0-9]{1,6}", a) for a in argv[1:]):
+                raise Refused("internal")
+            require_root_and_kernel()
+            lifetime, idle, ready_fd = (int(a) for a in argv[1:])
+            if not (60 <= lifetime <= MAX_LIFETIME and 60 <= idle <= MAX_LIFETIME):
+                raise Refused("internal")
+            daemon_main(lifetime, idle, ready_fd)
+        if argv[:1] == ["start"]:
+            opts = {"--lifetime": MAX_LIFETIME, "--idle": DEFAULT_IDLE}
+            rest = argv[1:]
+            if len(rest) % 2:
+                raise Refused("usage: start [--lifetime S] [--idle S]")
+            for k, v in zip(rest[::2], rest[1::2]):
+                if k not in opts or not re.fullmatch(r"[1-9][0-9]{0,5}", v):
+                    raise Refused("usage: start [--lifetime S] [--idle S]")
+                opts[k] = int(v)
+            return cmd_start(opts["--lifetime"], opts["--idle"])
+        if argv[:1] == ["tap"] and len(argv) == 3:
+            return cmd_tap(argv[1], argv[2])
+        if argv == ["status"]:
+            return cmd_status()
+        if argv == ["stop"]:
+            return cmd_stop()
+        if argv == ["pin-gate"]:
+            return cmd_pin_gate()
+        raise Refused("usage: i14-touch start|tap X Y|status|stop|pin-gate")
+    except Refused as e:
+        print(f"i14-touch: {e}", file=sys.stderr)
+        return 2 if str(e).startswith("usage") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

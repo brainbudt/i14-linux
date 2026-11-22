@@ -1,0 +1,6 @@
+#!/sbin/openrc-run
+description="I14: low CPU clock while idle with screen off; full governor range on demand"
+command=/usr/sbin/i14-cpufreq
+supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=0

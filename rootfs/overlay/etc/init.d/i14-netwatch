@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+description="I14: Wi-Fi watchdog (DHCP client, association, address, gateway; never reloads the driver)"
+command=/usr/sbin/i14-netwatch
+supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=0
+
+depend() {
+	need i14-wifi
+}

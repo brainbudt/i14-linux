@@ -1,0 +1,155 @@
+# Sourced by /i14init (busybox ash). Power-off charging, and the guard against
+# a start loop. Design: docs/AUTOBOOT-2026-11-04.md.
+#
+# In power-off charging (KPOC) the stock kernel charges by itself once the USB gadget is up
+# (usb_rdy), as it does under Linux. charge_wait watches the battery; when it has reserve, the
+# caller reboots with a plain reboot(RB_AUTOBOOT), the same call the stock charger app makes on
+# a long power key press. The bootloader then starts normally and /i14init starts Linux.
+#
+# Start-loop guard: a small state file on userdata. "handoff" is written before the reboot,
+# the next normal start turns it into "booting", and Linux removes it after 10 minutes
+# (/etc/local.d/i14-autoboot-ack.start). Power-off charging with any state file left means the
+# last start was not confirmed: charging on, but only the power key starts Linux.
+#
+# Paths can be overridden for the host tests (tests/test_i14_autoboot.py).
+PS=${I14_PS:-/sys/class/power_supply}
+UPTIME=${I14_UPTIME:-/proc/uptime}
+PWRKEY=${I14_PWRKEY:-/i14/pwrkey}
+AB_MIN_S=300   # charge at least this long before an automatic start
+AB_HOLD_S=120  # and all conditions must hold this long without a break
+AB_MAX_S=28800 # charging mode ends in rescue mode after 8 h (i14-charge-wait only, see charge_wait_rs)
+AB_MV=3800     # battery voltage (mV, measured while charging)
+AB_PCT=15      # capacity (%)
+AB_TEMP=450    # battery temperature at most 45.0 C (batt_temp is in 0.1 C), at least 0
+KEY_MV=3600    # a power key press starts Linux at once from this voltage
+NOPOWER_S=30   # no charger this long: power off
+BADREAD_S=60   # battery values unreadable this long: rescue mode
+STEP_S=5       # seconds between samples
+LOG_S=60       # seconds between log lines
+
+now() {
+	read -r u _ <"$UPTIME"
+	echo "${u%.*}"
+}
+
+num() { # num VALUE...: all are whole numbers (optionally negative)
+	for v; do
+		case ${v#-} in '' | *[!0-9]*) return 1 ;; esac
+	done
+}
+
+state_write() { # state_write FILE TEXT: replace FILE atomically and durably
+	printf '%s\n' "$2" >"$1.new" && sync && mv "$1.new" "$1" && sync
+}
+
+state_on_boot() { # state_on_boot FILE: a normal start after an automatic one ("handoff" -> "booting")
+	[ -e "$1" ] || return 0
+	s=$(cat "$1")
+	case "$s" in
+	handoff*) state_write "$1" "booting ${s#handoff }" || return 1 ;;
+	esac
+	log "autoboot state was: $s"
+}
+
+display_off() {
+	echo 4 >/sys/class/graphics/fb0/blank
+	echo 0 >/sys/class/leds/lcd-backlight/brightness
+} 2>/dev/null
+
+pwrkey_watch() { # touch $PWRKEY on every power key press (mtk-kpd, KEY_POWER 116, value 1)
+	ev=
+	for e in /sys/class/input/event*; do
+		[ "$(cat "$e/device/name" 2>/dev/null)" = mtk-kpd ] || continue
+		for n in /dev/input/${e##*/} /dev/${e##*/}; do [ -c "$n" ] && ev=$n; done
+	done
+	[ -n "$ev" ] || { log "charger: no power key input"; return 0; }
+	while :; do # one struct input_event (24 bytes on arm64): type 1, code 116, value 1
+		k=$(dd if="$ev" bs=24 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+		case "$k" in
+		*0100740001000000) : >"$PWRKEY" ;;
+		'') sleep 1 ;;
+		esac
+	done
+}
+
+# charge_wait: sample the battery until Linux should start. Sets $why and returns
+#   0  start Linux now (charged, or power key)
+#   1  rescue mode (values unreadable)
+#   2  power off (no charger)
+# AB_MAX_S is not used here: the optional Rust charge_wait_rs path ends
+# charging mode in rescue mode (why "charge time limit") once it has lasted AB_MAX_S.
+charge_wait() {
+	t0=$(now)
+	last=$t0 since= good=0 nopower=0 bad=0 logged=-$LOG_S
+	while :; do
+		i=0
+		while [ $i -lt $STEP_S ] && [ ! -e "$PWRKEY" ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		t=$(now)
+		dt=$((t - last)) last=$t
+		cap=$(cat $PS/battery/capacity) vol=$(cat $PS/battery/batt_vol) temp=$(cat $PS/battery/batt_temp)
+		st=$(cat $PS/battery/status) usb=$(cat $PS/usb/online) ac=$(cat $PS/ac/online)
+		if ! num "$cap" "$vol" "$temp" "$usb" "$ac" || [ -z "$st" ]; then
+			bad=$((bad + dt)) since= good=0
+			[ $bad -lt $BADREAD_S ] && continue
+			why="battery values unreadable for ${bad}s"
+			return 1
+		fi
+		bad=0
+		if [ $((t - logged)) -ge $LOG_S ]; then
+			log "charging: capacity=$cap% voltage=${vol}mV temp=$temp status=$st usb=$usb ac=$ac ok_for=${good}s"
+			logged=$t
+		fi
+		if [ "$usb" = 1 ] || [ "$ac" = 1 ]; then
+			nopower=0
+		else
+			nopower=$((nopower + dt))
+			if [ $nopower -ge $NOPOWER_S ]; then
+				why="no charger for ${nopower}s"
+				return 2
+			fi
+		fi
+		if [ -e "$PWRKEY" ]; then
+			rm -f "$PWRKEY"
+			if [ "$vol" -ge $KEY_MV ]; then
+				why="power key"
+				return 0
+			fi
+			log "charger: power key, but ${vol}mV is below ${KEY_MV}mV: charging on"
+		fi
+		case "$st" in Charging | Full) ok=1 ;; *) ok=0 ;; esac
+		if [ $nopower = 0 ] && [ $ok = 1 ] && [ $((t - t0)) -ge $AB_MIN_S ] && [ "$vol" -ge $AB_MV ] &&
+			[ "$cap" -ge $AB_PCT ] && [ "$temp" -ge 0 ] && [ "$temp" -le $AB_TEMP ]; then
+			since=${since:-$t}
+			good=$((t - since))
+		else
+			since= good=0
+		fi
+		if [ $good -ge $AB_HOLD_S ]; then
+			why="charged"
+			return 0
+		fi
+	done
+}
+
+charge_wait_rs() {
+	cw_out=$(AB_PCT=$AB_PCT AB_MIN_S=$AB_MIN_S AB_HOLD_S=$AB_HOLD_S AB_MAX_S=$AB_MAX_S i14-charge-wait)
+	cw_rc=$?
+	cw_nl='
+'
+	cw_cr=$(printf '\r')
+	case $cw_rc in 0|1|2) ;; *) cw_out= ;; esac
+	case $cw_out in *"$cw_cr"*) cw_out= ;; esac  # i14-charge-wait never prints a CR
+	cw_why=${cw_out#why=}; cw_why=${cw_why%%"$cw_nl"*}
+	cw_cap=${cw_out#*"${cw_nl}cap="}; cw_cap=${cw_cap%%"$cw_nl"*}
+	cw_vol=${cw_out#*"${cw_nl}vol="}; cw_vol=${cw_vol%%"$cw_nl"*}
+	# The whole output must be exactly the frame rebuilt from the three values.
+	if [ -z "$cw_out" ] || [ "$cw_out" != "why=$cw_why${cw_nl}cap=$cw_cap${cw_nl}vol=$cw_vol${cw_nl}end" ]; then
+		why="i14-charge-wait failed (exit $cw_rc)"; cap=; vol=
+		return 1
+	fi
+	why=$cw_why cap=$cw_cap vol=$cw_vol
+	return $cw_rc
+}

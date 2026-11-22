@@ -1,0 +1,24 @@
+[package]
+name = "i14-tools"
+description = "Host-side I14 tools (image building, offline backup verification), ports of scripts/*.py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# zlib backend: the gzip streams must be byte-identical to Python's gzip/zlib output.
+flate2 = { version = "1.1", default-features = false, features = ["zlib"] }
+libc.workspace = true
+sha1 = "0.10"
+sha2 = "0.10"
+# Already in Cargo.lock via flate2; GPT CRC32 (IEEE, same polynomial as zlib).
+crc32fast = "1.5"
+
+[[bin]]
+name = "i14-build-boot"
+path = "src/bin/i14-build-boot.rs"
+
+[[bin]]
+name = "i14-verify-backup"
+path = "src/bin/i14-verify-backup.rs"

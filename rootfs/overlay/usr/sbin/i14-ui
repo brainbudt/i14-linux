@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""I14 on-device interface: status, terminal, Wi-Fi, Bluetooth and settings (package /usr/lib/i14ui)."""
+import sys
+
+sys.path.insert(0, "/usr/lib")
+from i14ui.app import main  # noqa: E402
+
+main()

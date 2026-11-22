@@ -1,0 +1,8 @@
+#!/bin/sh
+# Keep the own logs small (syslog rotates itself at 200 KiB): a log over 512 KiB keeps its newest
+# 256 KiB, cut at a line start. The writers open the file per line, so replacing it is safe.
+for f in ${I14_LOGS:-/var/log/i14-*.log /mnt/data/media/0/i14-linux/i14init.log}; do
+	[ -f "$f" ] || continue
+	[ "$(wc -c <"$f")" -gt 524288 ] || continue
+	tail -c 262144 "$f" | sed 1d >"$f.trim" && mv "$f.trim" "$f"
+done

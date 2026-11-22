@@ -1,0 +1,62 @@
+#!/bin/sh
+# Keep the battery voltage in a band with the cable attached, using the stock driver's
+# "force discharge" switch (/proc/mtk_battery_cmd/current_cmd "<usb unlimited> <discharge>").
+# Used to bring the battery into the Phase-4 E4 window (rest VBAT 3.8-4.1 V) and keep it there.
+#   i14-charge-hold start [lo_mv] [hi_mv]   default 3950 4050; runs in the background
+#   i14-charge-hold stop                    charging back on (as i14-battery-guard sets it)
+#   i14-charge-hold status
+# The switch lives in kernel RAM only: a reboot always ends the hold (charging on).
+# Above hi: discharge. At or below lo: charge. Never below 3700 mV or 15 %: charge.
+B=${I14_BATTERY:-/sys/class/power_supply/battery}
+TYPE=${I14_CHARGER_TYPE:-/sys/devices/platform/battery/Charger_Type}
+CMD=${I14_CURRENT_CMD:-/proc/mtk_battery_cmd/current_cmd}
+PID=${I14_HOLD_PID:-/run/i14-charge-hold.pid}
+LOG=${I14_HOLD_LOG:-/var/log/i14-charge-hold.log}
+STEP=${I14_HOLD_STEP:-30}
+
+unlimited() { [ "$(cat $TYPE)" = 2 ] && echo 1 || echo 0; }
+set_discharge() { echo "$(unlimited) $1" >$CMD; }
+running() { [ -f $PID ] && kill -0 "$(cat $PID)" 2>/dev/null; }
+
+case "${1:-}" in
+start)
+	lo=${2:-3950} hi=${3:-4050}
+	[ "$lo" -ge 3700 ] && [ "$hi" -le 4200 ] && [ "$lo" -lt "$hi" ] || { echo "band must be 3700 <= lo < hi <= 4200"; exit 2; }
+	running && { echo "already running (pid $(cat $PID))"; exit 1; }
+	(
+		trap 'set_discharge 0; echo "$(date "+%F %T") stop: charging on" >>$LOG; exit 0' TERM INT
+		state=
+		while :; do
+			v=$(cat $B/batt_vol) cap=$(cat $B/capacity)
+			want=$state
+			if [ "$v" -le 3700 ] || [ "$cap" -le 15 ] || [ "$v" -le "$lo" ]; then want=0
+			elif [ "$v" -ge "$hi" ]; then want=1
+			fi
+			[ -z "$want" ] && want=0
+			# written every round: i14-battery-guard writes "<x> 0" when the charger type changes
+			set_discharge "$want"
+			if [ "$want" != "$state" ]; then
+				state=$want
+				echo "$(date '+%F %T') voltage=$v capacity=$cap discharge=$want" >>$LOG
+			fi
+			sleep $STEP &
+			wait $!
+		done
+	) </dev/null >/dev/null 2>&1 &
+	echo $! >$PID
+	echo "holding $lo-$hi mV (pid $!)"
+	;;
+stop)
+	running && kill "$(cat $PID)"
+	rm -f $PID
+	set_discharge 0
+	echo "charging on"
+	;;
+status)
+	running && echo "running (pid $(cat $PID))" || echo "not running"
+	echo "status=$(cat $B/status) voltage=$(cat $B/batt_vol) capacity=$(cat $B/capacity)"
+	tail -n 3 $LOG 2>/dev/null
+	;;
+*)
+	echo "usage: i14-charge-hold start [lo_mv] [hi_mv] | stop | status"; exit 2 ;;
+esac

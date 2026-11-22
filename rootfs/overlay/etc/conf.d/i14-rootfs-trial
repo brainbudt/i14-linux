@@ -1,0 +1,3 @@
+# Rootfs trial watcher (/usr/sbin/i14-rootfs-trial, docs/ROOTFS-SWAP-ROLLBACK.md): a new rootfs
+# is confirmed only once all of these services are started and sshd listens on port 22.
+i14_trial_services="networking sshd chronyd crond syslog i14-power i14-cpufreq i14-usbnet i14-wifi i14-netwatch unbound i14-ui"

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/i14-sys",
+    "crates/i14-probe",
+    "crates/i14-config",
+    "crates/i14-ui",
+    "crates/i14-power",
+    "crates/i14-cpufreq",
+    "crates/i14-netwatch",
+    "crates/i14-soak",
+    "crates/i14-util",
+    "crates/i14-charge",
+    "crates/i14-tools",
+    "crates/i14-fastboot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+libc = "=0.2.182"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Same board and initramfs; explicit opt-out from the RAM-trial reboot timer. */
+#include "mt6735-i14-bringup.dts"
+
+/ {
+	chosen {
+		bootargs = "console=tty0 console=ttyS0,921600n8 root=/dev/ram rdinit=/init ignore_loglevel loglevel=8 nokaslr panic=10 clk_ignore_unused pd_ignore_unused regulator_ignore_unused i14.trial_reboot=off";
+		zimage64,cmdline-override = "console=tty0 console=ttyS0,921600n8 root=/dev/ram rdinit=/init ignore_loglevel loglevel=8 nokaslr panic=10 clk_ignore_unused pd_ignore_unused regulator_ignore_unused i14.trial_reboot=off";
+	};
+};

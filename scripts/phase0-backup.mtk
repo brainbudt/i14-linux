@@ -1,0 +1,8 @@
+printgpt
+r proinfo,nvram,protect1,protect2,lk,para,boot,recovery,logo,expdb,seccfg,oemkeystore,secro,keystore,tee1,tee2,frp,nvdata,metadata,flashinfo proinfo.img,nvram.img,protect1.img,protect2.img,lk.img,para.img,boot.img,recovery.img,logo.img,expdb.img,seccfg.img,oemkeystore.img,secro.img,keystore.img,tee1.img,tee2.img,frp.img,nvdata.img,metadata.img,flashinfo.img
+rf boot-region1.bin --parttype=boot1
+rf boot-region2.bin --parttype=boot2
+ro 0x0 0x100000 primary-userarea.bin --parttype=user
+ro 0x3a3d00000 0x100000 tail-userarea.bin --parttype=user
+r system system.img
+r cache cache.img

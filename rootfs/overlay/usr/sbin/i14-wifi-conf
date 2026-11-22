@@ -1,0 +1,27 @@
+#!/bin/sh
+# Write wpa_supplicant's start file /run/i14-wpa.conf from the saved networks: the rootfs file and the
+# userdata copy (kept when rootfs.img is replaced). Called by /etc/init.d/i14-wifi before a start and by
+# the touch interface (i14-ui) after every change, so a supervise-daemon respawn of wpa_supplicant
+# starts with the current networks. While Wi-Fi is switched off (flag file) every network gets
+# disabled=1: wpa_supplicant then never associates, not even after a respawn or reboot.
+# Root only (0600): the file holds the Wi-Fi keys. Replaced atomically.
+OUT=${I14_WPA_CONF:-/run/i14-wpa.conf}
+NETWORKS=${I14_WIFI_NETWORKS:-/mnt/data/media/0/i14-linux/wpa_supplicant.conf}
+ROOTFS=${I14_WIFI_ROOTFS_NETWORKS:-/etc/wpa_supplicant/wpa_supplicant.conf}
+OFF=${I14_WIFI_OFF:-/mnt/data/media/0/i14-linux/wifi-off}
+python3 "$(dirname "$0")/../lib/i14ui/settings_files.py" "$NETWORKS" "$ROOTFS" || exit 1
+off=0
+[ -e "$OFF" ] && off=1
+tmp=$OUT.new.$$
+rm -f "$tmp"
+(
+	umask 077 # created inside the subshell, so 0600
+	{
+		echo "ctrl_interface=/run/wpa_supplicant"
+		echo "update_config=0"
+		for f in "$ROOTFS" "$NETWORKS"; do
+			[ -f "$f" ] || continue
+			awk -v off=$off '/^network=\{/{f=1} f && /^\}/ && off {print "\tdisabled=1"} f{print} /^\}/{f=0}' "$f"
+		done
+	} >"$tmp"
+) && mv -f "$tmp" "$OUT" || { rm -f "$tmp"; exit 1; }

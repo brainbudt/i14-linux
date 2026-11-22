@@ -1,0 +1,38 @@
+Captured at UTC: 2026-11-05T20:38:06.583310+00:00
+Agent host: macOS, original I14 project checkout
+Command host: I14 phone, SSH alias i14
+Mode: read-only; no service or configuration changes
+
+Kernel:
+Linux 3.18.19 aarch64
+OS:
+NAME="Alpine Linux"
+ID=alpine
+VERSION_ID=3.24.3
+PRETTY_NAME="Alpine Linux v3.24"
+HOME_URL="https://alpinelinux.org/"
+BUG_REPORT_URL="https://gitlab.alpinelinux.org/alpine/aports/-/issues"
+
+Services:
+i14-ui: * status: started (exit 0)
+i14-power: * status: started (exit 0)
+i14-cpufreq: * status: started (exit 0)
+i14-wifi: * status: started (exit 0)
+i14-netwatch: * status: started (exit 0)
+unbound: * status: started (exit 0)
+sshd: * status: started (exit 0)
+Storage:
+Filesystem                Size      Used Available Use% Mounted on
+/dev/loop0                2.9G     82.0M      2.6G   3% /
+Memory: MemTotal:        1970112 kB
+Possible CPUs: 0-3
+eMMC bytes: 15634268160
+Charge summary: {"backend": "bcct", "enabled": true, "error": null, "level": 79, "limit": 80, "paused": true, "valid": true}
+Local DNS health:
+Server:		127.0.0.1
+Address:	127.0.0.1:53
+
+Name:	i14-health.invalid
+Address: 192.0.2.1
+
+

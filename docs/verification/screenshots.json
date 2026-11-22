@@ -1,0 +1,14 @@
+[
+  {
+    "path": "assets/screenshots/settings.png",
+    "source": "Existing native framebuffer capture, 2026-11-05, settings page after battery UI update",
+    "sha256": "7413fba763c8359923dba7008288f9d5820b3d9148b443b73f5a8b59538de823",
+    "byte_identical": true
+  },
+  {
+    "path": "assets/screenshots/boot.png",
+    "source": "Existing native framebuffer capture from the boot-splash investigation, 2026-11-03",
+    "sha256": "5c3546b38215b4384740efe479a60652956aeac93f1dbb8d4c0033d05a62c968",
+    "byte_identical": true
+  }
+]

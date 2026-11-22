@@ -1,0 +1,132 @@
+#!/usr/bin/python3
+"""Stock MT6735: idle at 299 MHz with display off; release the cap on demand.
+
+The vendor driver overrides the governor twice during early suspend. Use its
+existing max-frequency control; never program PLLs, voltages or CPU hotplug.
+"""
+import fcntl
+import re
+import signal
+import sys
+import syslog
+import time
+from pathlib import Path
+
+
+class Policy:
+    def __init__(self, root=Path("/")):
+        self.root = Path(root)
+        self.proc = self.root / "proc/cpufreq"
+        self.cpu = self.root / "sys/devices/system/cpu/cpu0/cpufreq"
+        self.cap = self.proc / "cpufreq_limited_max_freq_by_user"
+        self.fix = self.proc / "cpufreq_fix_freq_in_es"
+        self.started = False
+        self.applied = 0
+        self.quiet = 0
+
+    def counters(self):
+        values = {}
+        for line in (self.root / "proc/stat").read_text().splitlines():
+            fields = line.split()
+            if fields and re.fullmatch(r"cpu[0-9]+", fields[0]):
+                ticks = tuple(int(v) for v in fields[1:9])  # exclude duplicated guest time
+                if len(ticks) != 8 or min(ticks) < 0:
+                    raise ValueError("invalid per-CPU counters")
+                values[fields[0]] = ticks
+        if not values:
+            raise ValueError("no per-CPU counters")
+        return values
+
+    def screen_off(self):
+        match = re.search(r"^dvfs_disable_by_early_suspend = ([01])$",
+                          (self.proc / "cpufreq_state").read_text(), re.M)
+        if not match:
+            raise ValueError("missing driver screen state")
+        return match[1] == "1"
+
+    @staticmethod
+    def write(path, value):
+        path.write_text(f"{value}\n")
+        if int(path.read_text()) != value:
+            raise RuntimeError(f"CPU control readback mismatch: {path}")
+
+    def start(self):
+        if (self.cpu / "scaling_driver").read_text().strip() != "mt-cpufreq":
+            raise RuntimeError("requires the stock MT6735 CPUfreq driver")
+        if (self.cpu / "scaling_governor").read_text().strip() not in ("interactive", "ondemand"):
+            raise RuntimeError("requires an automatic CPUfreq governor")
+        available = (self.cpu / "scaling_available_frequencies").read_text().split()
+        self.original_fix = int(self.fix.read_text())
+        if "299000" not in available or self.original_fix not in (0, 1) or int(self.cap.read_text()) != 0:
+            raise RuntimeError("unexpected CPU controls or an existing frequency cap")
+        self.previous = self.counters()
+        self.screen_off()
+        self.started = True
+        self.write(self.fix, 0)
+
+    def limit(self, value):
+        if int(self.cap.read_text()) != self.applied:
+            raise RuntimeError("CPU limit changed externally; leaving that value alone")
+        if value != self.applied:
+            self.applied = value
+            self.write(self.cap, value)
+            syslog.syslog(f"CPU max: {value} kHz" if value else "CPU max: governor control")
+
+    def tick(self):
+        if int(self.fix.read_text()) != 0:
+            raise RuntimeError("screen-off CPU fix changed externally")
+        current = self.counters()
+        load = []
+        if current.keys() == self.previous.keys():
+            for cpu, ticks in current.items():
+                delta = [a - b for a, b in zip(ticks, self.previous[cpu])]
+                total = sum(delta)
+                if min(delta) < 0 or total <= 0:
+                    load = []
+                    break
+                load.append((total - delta[3] - delta[4]) / total)
+        self.previous = current
+        # Use the busiest core: an aggregate would hide a single busy thread.
+        busy = max(load) if load else 1.0
+        if not self.screen_off() or busy >= 0.30:
+            self.quiet = 0
+            self.limit(0)
+        elif busy < 0.05:
+            self.quiet = min(self.quiet + 1, 5)
+            self.limit(299000 if self.quiet >= 5 else self.applied)
+        else:
+            self.quiet = 0
+            self.limit(self.applied)
+
+    def close(self):
+        if self.started:
+            try:
+                if int(self.cap.read_text()) == self.applied:
+                    self.write(self.cap, 0)
+            finally:
+                if int(self.fix.read_text()) == 0:
+                    self.write(self.fix, self.original_fix)
+            self.started = False
+
+
+def main():
+    syslog.openlog("i14-cpufreq")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open("/run/i14-cpufreq.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        policy = Policy()
+        try:
+            policy.start()
+            syslog.syslog("screen-off CPU policy started")
+            while True:
+                time.sleep(1)
+                policy.tick()
+        finally:
+            policy.close()
+            syslog.syslog("screen-off CPU policy stopped; settings restored where still owned")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Reboot straight into the bootloader's fastboot mode (busybox reboot cannot pass "bootloader")."""
+import ctypes
+import os
+import subprocess
+
+subprocess.run(["sync"], check=False)
+os.sync()
+libc = ctypes.CDLL(None, use_errno=True)
+# reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, "bootloader"); 142 = __NR_reboot on arm64
+if libc.syscall(142, 0xFEE1DEAD, 672274793, 0xA1B2C3D4, b"bootloader") != 0:
+    raise SystemExit(os.strerror(ctypes.get_errno()))

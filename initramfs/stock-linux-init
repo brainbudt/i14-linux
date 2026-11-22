@@ -1,0 +1,124 @@
+#!/bin/sh
+# Phase-1 RAM trial on the stock 3.18.19 kernel (fastboot boot, nothing is flashed).
+# The stock kernel charges by itself (builtin BAT_thread) once the USB gadget is
+# enabled. This init only adds: read-only storage, a USB-ACM root console and a
+# battery log in /run/i14-battery.log. Return to Android: `reboot -f`.
+log() {
+    printf '%s\n' "$*"
+    printf '<6>%s\n' "$*" >/dev/kmsg 2>/dev/null || :
+}
+mounts() {
+    mount -t proc -o nosuid,nodev,noexec proc /proc || return 1
+    mount -t sysfs -o nosuid,nodev,noexec sysfs /sys || return 1
+    mount -t devtmpfs -o nosuid devtmpfs /dev ||
+        mount -t tmpfs -o nosuid,mode=0755 tmpfs /dev || return 1
+    mount -t tmpfs -o nosuid,nodev,noexec,mode=0755 tmpfs /run || return 1
+    # A tmpfs /dev hides the cpio's /dev/kmsg; recreate nodes so later logs reach last_kmsg.
+    mdev -s || return 1
+}
+identity() {
+    read -r release rest </proc/sys/kernel/osrelease || return 1
+    [ "$release" = 3.18.19 ] || return 1
+    model=$(sha256sum /proc/device-tree/model) || return 1
+    compatible=$(sha256sum /proc/device-tree/compatible) || return 1
+    [ "${model%% *}" = 77a29783599bebf2f2e339bea3f14992c9870f6f08bb211cd1a62da9ebbfe5ae ] || return 1
+    [ "${compatible%% *}" = 33d69af0dce2161bb2211a0bb3c91313905301bae14f4d474de0204a74a4b47a ] || return 1
+    log "I14_STOCK_KERNEL release=$release"
+}
+storage_nodes() {
+    # MMC probes may finish after /init; tmpfs /dev has no automatic node updates.
+    tries=0
+    while :; do
+        mdev -s || return 1
+        count=0
+        for node in /dev/mmcblk0 /dev/mmcblk0boot* /dev/mmcblk0p*; do
+            if [ -b "$node" ]; then count=$((count + 1)); fi
+        done
+        [ "$count" -ne 26 ] || return 0
+        [ "$count" -lt 26 ] || return 1
+        tries=$((tries + 1))
+        [ "$tries" -lt 10 ] || return 1
+        sleep 1
+    done
+}
+storage_guard() {
+    /storage-readonly || return 1
+    read -r capacity </run/i14-storage-ro.ready || return 1
+    [ "$capacity" = capacity_bytes=15634268160 ] || return 1
+    count=0
+    for node in /dev/mmcblk0 /dev/mmcblk0boot* /dev/mmcblk0p*; do
+        [ -b "$node" ] || return 1
+        [ "$(blockdev --getro "$node")" = 1 ] || return 1
+        count=$((count + 1))
+    done
+    [ "$count" = 26 ] || return 1
+    log I14_STOCK_STORAGE_26_RO
+}
+write_usb() { printf '%s' "$2" >"/sys/class/android_usb/android0/$1"; }
+gadget() {
+    # Same ACM-only setup as the own stock init.mt6735.usb.rc; enabling the
+    # gadget sets usb_rdy, which releases the kernel battery thread.
+    write_usb enable 0 || return 1
+    write_usb idVendor 0E8D || return 1
+    write_usb idProduct 2007 || return 1
+    write_usb iManufacturer 'I14' || return 1
+    write_usb iProduct 'Stock kernel Linux' || return 1
+    write_usb iSerial I14-STOCK-LINUX || return 1
+    write_usb f_acm/instances 1 || return 1
+    write_usb functions acm || return 1
+    write_usb bDeviceClass 02 || return 1
+    write_usb enable 1 || return 1
+}
+console() {
+    tries=0
+    while [ ! -c /dev/ttyGS0 ]; do
+        mdev -s || return 1
+        tries=$((tries + 1))
+        [ "$tries" -lt 10 ] || return 1
+        sleep 1
+    done
+    # Respawn so a USB hangup or `exit` does not lose the console for this boot.
+    setsid sh -c 'while :; do sh </dev/ttyGS0 >/dev/ttyGS0 2>&1; sleep 1; done' &
+}
+power_line() {
+    read -r up rest </proc/uptime
+    line="t=$up"
+    for dir in /sys/class/power_supply/*; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*; do
+            [ -f "$f" ] && [ -r "$f" ] || continue
+            case "${f##*/}" in uevent) continue ;; esac
+            if read -r v <"$f" 2>/dev/null; then line="$line ${dir##*/}.${f##*/}=$v"; fi
+        done
+    done
+    printf '%s\n' "$line"
+}
+battery_log() {
+    while :; do
+        power_line >>/run/i14-battery.log
+        sleep 30
+    done
+}
+fail() {
+    # Without the gadget the battery thread may not run: go back to Android,
+    # which charges, instead of draining the battery here.
+    log "I14_STOCK_LINUX_FAILED step=$1; rebooting to Android in 60 s"
+    sleep 60
+    reboot -f
+}
+main() {
+    log I14_STOCK_LINUX_BEGIN
+    # This BusyBox has no `command` builtin (ASH_CMDCMD off): check the applet links.
+    [ -x /bin/blockdev ] && [ -x /bin/mdev ] || fail requirements
+    mounts || fail mounts
+    identity || fail identity
+    storage_nodes || fail storage_nodes
+    storage_guard || fail storage_guard
+    gadget || fail gadget
+    battery_log &
+    console || log I14_STOCK_LINUX_NO_CONSOLE
+    log I14_STOCK_LINUX_READY
+}
+main
+# PID 1 must never exit.
+while :; do sleep 3600; done

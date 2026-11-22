@@ -1,0 +1,16 @@
+required-version = "==0.15.12"
+target-version = "py313"
+
+extend-include = [
+    "scripts/i14-touch",
+    "rootfs/overlay/usr/sbin/i14-battery-guard",
+    "rootfs/overlay/usr/sbin/i14-cpufreq",
+    "rootfs/overlay/usr/sbin/i14-reboot-bootloader",
+    "rootfs/overlay/usr/sbin/i14-splash",
+    "rootfs/overlay/usr/sbin/i14-status",
+    "rootfs/overlay/usr/sbin/i14-ui",
+]
+
+[lint]
+# Check correctness first; adopting style rules would reformat the older Python code.
+select = ["E9", "F63", "F7", "F82"]

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Read-only MT6328 register dump through the stock kernel's pmic_access node.
+# store_pmic_access() treats input of MORE than 5 bytes as a register WRITE
+# ("addr value"); 5 bytes or fewer is a read. We always send at most 4 hex
+# digits without newline, so this script can only read.
+# Usage: i14-pmic-dump [start] [end]   (hex or decimal, default 0x0000 0x0ffe)
+start=${1:-0}
+end=${2:-0x0ffe}
+node=${I14_PMIC_ACCESS:-}
+[ -n "$node" ] || for n in /sys/devices/platform/*/pmic_access /sys/devices/*/pmic_access /sys/devices/platform/*/*/pmic_access; do
+    if [ -e "$n" ]; then node=$n; break; fi
+done
+[ -n "$node" ] || { echo "pmic_access not found" >&2; exit 1; }
+a=$((start))
+last=$((end))
+[ "$a" -ge 0 ] && [ "$last" -le 65535 ] && [ "$a" -le "$last" ] || { echo "bad range" >&2; exit 1; }
+echo "# node=$node"
+while [ "$a" -le "$last" ]; do
+    req=$(printf '%x' "$a")
+    [ "${#req}" -le 4 ] || exit 1
+    printf '%s' "$req" >"$node" || exit 1
+    v=
+    read -r v <"$node" || [ -n "$v" ] || exit 1
+    printf '0x%04x %s\n' "$a" "$v"
+    a=$((a + 2))
+done

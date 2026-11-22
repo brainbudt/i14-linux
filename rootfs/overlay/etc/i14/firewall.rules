@@ -1,0 +1,18 @@
+# IPv4 firewall (iptables-legacy-restore; the 3.18 kernel has no nf_tables, and only the "state" match).
+# IPv4 management is on USB. The builder adds the allowed DNS client sources from one list.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:I14_DNS - [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -m state --state INVALID -j DROP
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i rndis0 -p udp --sport 68 --dport 67 -j ACCEPT
+-A INPUT -i rndis0 -s 172.16.42.0/24 -p tcp --dport 22 -j ACCEPT
+-A INPUT -i wlan0 -p udp --sport 67 --dport 68 -j ACCEPT
+-A INPUT -i wlan0 -p udp --dport 53 -j I14_DNS
+-A INPUT -i wlan0 -p tcp --dport 53 -j I14_DNS
+# I14_DNS_CLIENTS
+COMMIT

@@ -1,0 +1,70 @@
+#!/sbin/openrc-run
+description="I14: firewall (/etc/i14/firewall.rules and firewall6.rules, iptables-legacy)"
+rules_dir=${I14_FIREWALL_RULES_DIR:-/etc/i14}
+
+depend() {
+	before net i14-wifi i14-usbnet sshd
+	provide firewall
+}
+
+isolate() {
+	local failed=0 table iface service
+	for table in iptables-legacy ip6tables-legacy; do
+		"$table" -P INPUT DROP || failed=1
+		"$table" -P FORWARD DROP || failed=1
+	done
+	for table in iptables-legacy ip6tables-legacy; do
+		# Replace any previous ACCEPT rules, including during a restart.
+		printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT ACCEPT [0:0]' \
+			'-A INPUT -i lo -j ACCEPT' COMMIT | "${table}-restore" || failed=1
+	done
+	if [ "$failed" -ne 0 ]; then
+		for service in i14-netwatch sshd unbound i14-wifi i14-usbnet; do
+			rc-service -D "$service" stop || :
+		done
+		for iface in wlan0 rndis0; do
+			ip link set "$iface" down || :
+		done
+		return 1
+	fi
+}
+
+load_guarded() {
+	local rules
+	rules=$(awk '
+		!guard && (/^-A / || /^COMMIT$/) {
+			print "-A INPUT ! -i lo -j DROP"
+			print "-A FORWARD -j DROP"
+			guard = 1
+		}
+		{ print }
+		END { if (!guard) exit 1 }
+	' "$2") || return 1
+	printf '%s\n' "$rules" | "$1"
+}
+
+start() {
+	ebegin "Loading firewall rules"
+	if ! isolate; then
+		eend 1
+		return 1
+	fi
+	if load_guarded iptables-legacy-restore "$rules_dir/firewall.rules" &&
+		load_guarded ip6tables-legacy-restore "$rules_dir/firewall6.rules" &&
+		iptables-legacy -D FORWARD -j DROP &&
+		ip6tables-legacy -D FORWARD -j DROP &&
+		iptables-legacy -D INPUT ! -i lo -j DROP &&
+		ip6tables-legacy -D INPUT ! -i lo -j DROP; then
+		eend 0
+		return 0
+	fi
+	isolate
+	eend 1
+	return 1
+}
+
+stop() {
+	ebegin "Blocking network access"
+	isolate
+	eend $?
+}

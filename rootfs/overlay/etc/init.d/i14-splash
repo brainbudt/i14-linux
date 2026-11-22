@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+description="I14: animated boot splash until the end of boot, then display off"
+# Runs once and ends by itself (stop file from i14-status or local.d, or 60 s): not supervised,
+# so OpenRC does not report it as crashed when it is done. i14-power reads the pidfile.
+pidfile=/run/i14-splash.pid
+
+depend() {
+	after devfs
+	before dmesg mdev  # /dev/fb0 and /dev/kmsg come from /i14init: start as early as possible
+}
+
+start() {
+	ebegin "Starting the boot splash"
+	rm -f /run/i14-splash.stop
+	/usr/sbin/i14-splash >>/var/log/i14-splash.log 2>&1 &
+	echo $! >"$pidfile"
+	eend 0
+}
+
+stop() {
+	ebegin "Stopping the boot splash"
+	touch /run/i14-splash.stop
+	eend 0
+}

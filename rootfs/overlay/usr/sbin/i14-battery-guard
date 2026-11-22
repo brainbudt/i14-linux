@@ -1,0 +1,16 @@
+#!/usr/bin/python3
+"""i14-power: charge limit, CDP current policy and low-battery shutdown."""
+import sys
+import os
+
+sys.path.insert(0, "/usr/lib")
+try:
+    from i14ui.charging import main
+except Exception:
+    # Even a broken/missing Python package must release a previous force-discharge.
+    with open(os.environ.get("I14_CURRENT_CMD", "/proc/mtk_battery_cmd/current_cmd"), "w") as f:
+        f.write("0 0\n")
+    raise
+
+if __name__ == "__main__":
+    main()

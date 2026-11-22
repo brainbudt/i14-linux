@@ -1,0 +1,31 @@
+[package]
+name = "i14-fastboot"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+description = "Bounded Fastboot boot/boot-install tools for the I14 (port of scripts/fastboot_usb.py and scripts/install_boot_usb.py)"
+
+
+[lib]
+name = "i14_fastboot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "i14-fastboot"
+path = "src/bin/i14-fastboot.rs"
+
+[[bin]]
+name = "i14-install-boot"
+path = "src/bin/i14-install-boot.rs"
+
+[dependencies]
+nusb = "=0.2.8"
+sha2 = "=0.10.9"
+signal-hook = "=0.4.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+serde_json = "=1.0.154"

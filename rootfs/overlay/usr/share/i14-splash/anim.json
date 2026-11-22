@@ -1,0 +1,34 @@
+{
+ "w": 720,
+ "h": 1600,
+ "format": "RGBA",
+ "tick_ms": 250,
+ "cursor": {
+  "period_ticks": 2,
+  "box": [
+   360,
+   755,
+   79,
+   13
+  ],
+  "states": [
+   "eNrt0DENADAIADA5ONmDAzRN2FyBhp0kPWqg9W4X3yKPB3fu3LnDnTt37nDnzt3KuwEC37Ag",
+   "eNrtwzENAAAIAzATu3GAf3lDCG3SzDaqqqrqmwd2jHxm"
+  ]
+ },
+ "dots": {
+  "period_ticks": 2,
+  "box": [
+   417,
+   1013,
+   26,
+   5
+  ],
+  "states": [
+   "eNoTUI3+LzCKRzwGAHgPyp8=",
+   "eNoTUI3+H5o5+X/3/P3/O+bs/e8Z2/lfAChGbWwX3Ph/2qoTKFjfpYTq9sQUzMSwxyu+i+b+mbryxH8dxyKahF0IKH4WgOJnz3+36Haa2AEAae3naw==",
+   "eNoTUI3+H5o5+X/3/P3/O+bs/e8Z2/lfACiGDROrDhu2C278P23VCRSs71JCtjpcOKZgJoZ+r/gustUR65+pK0/813EsIlsdPhwCCvcFoHDf898tup1iddgwANugBEY=",
+   "eNoTUI3+H5o5+X/3/P3/O+bs/e8Z2/lfACiGDVOizi648f+0VSdQsL5LCYZeStXFFMzEEPeK78LQT6k6dPunrjzxX8exiKA7yVEXAgrPBaDw3PPfLbodZ7hTog4AzTchEg=="
+  ]
+ }
+}
