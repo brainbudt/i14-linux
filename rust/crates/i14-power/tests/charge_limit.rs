@@ -95,7 +95,8 @@ impl T {
         paused: bool,
     ) -> serde_json::Value {
         if self.now.is_none() {
-            self.now = Some(Rc::new(Cell::new(i14_sys::monotonic())));
+            // Use an exact integer start >= activity_changed so f64 + 60.0 never rounds below 60.0.
+            self.now = Some(Rc::new(Cell::new(i14_sys::monotonic().ceil())));
             write(self.d.join("boot_id"), "test-boot"); // BOOT_ID is patched to this file
             self.guard.boot_id = "test-boot".into();
         }
