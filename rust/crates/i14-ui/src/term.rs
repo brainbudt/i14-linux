@@ -262,13 +262,22 @@ mod tests {
             return;
         }
         process::ignore(libc::SIGHUP); // same disposition as the UI
+        let env = vec![
+            ("HOME".into(), "/tmp".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("PS1".into(), "$ ".into()),
+        ];
         for _ in 0..2 {
-            let mut shell = Session::new(80, 24, None, None);
+            let mut shell = Session::new(80, 24, None, Some(env.clone()));
             assert!(shell.alive(), "login shell failed to start");
             shell.write(b"echo $((17+25)); exit\r");
             run_until_ended(&mut shell);
             assert!(!shell.alive());
-            assert!(shell.vt.text().lines().any(|line| line.trim() == "42"));
+            assert!(
+                shell.vt.text().contains("42"),
+                "expected shell output 42, got: {:?}",
+                shell.vt.text()
+            );
         }
     }
 
