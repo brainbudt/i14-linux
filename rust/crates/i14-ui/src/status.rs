@@ -57,7 +57,7 @@ pub fn level_text(s: Option<&ChargeStatus>) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Battery {
-    /// "~80" or "?"
+    /// "80", "~80" or "?"
     pub cap: String,
     /// Kernel-style word for colouring: "Charging", "Discharging", ...
     pub state: &'static str,
@@ -65,6 +65,79 @@ pub struct Battery {
     pub word: &'static str,
     pub current: String,
     pub volt: String,
+    /// Estimated remaining charge/discharge time (e.g. "~48 min tot 80%"), when HW-CAR data is present.
+    pub eta: Option<String>,
+}
+
+fn format_duration(total_mins: i64) -> String {
+    if total_mins < 1 {
+        return "<1 min".into();
+    }
+    if total_mins < 60 {
+        return format!("~{total_mins} min");
+    }
+    let h = total_mins / 60;
+    let m = total_mins % 60;
+    if m == 0 {
+        format!("~{h} u")
+    } else {
+        format!("~{h} u {m:02} m")
+    }
+}
+
+/// Estimate remaining charge time (to `limit` or 100%, accounting for linear-charger duty cycle
+/// and CV taper above 85%) or remaining discharge time, from the HW-CAR snapshot.
+pub fn battery_eta(s: &ChargeStatus, state: &str) -> Option<String> {
+    let q_rem = s.raw.get("q_rem_mah")?.as_f64()?;
+    let q_full = s.raw.get("q_full_mah")?.as_f64()?;
+    let act = s.raw.get("activity")?.as_i64()?;
+    if !q_rem.is_finite() || !q_full.is_finite() || q_full <= 100.0 {
+        return None;
+    }
+    let i_ma = act as f64 / 10.0; // negative = charging, positive = discharging/paused
+    if state == "Charging" && i_ma < -50.0 {
+        let target_pct = if s.enabled && s.limit < 100 {
+            s.limit
+        } else {
+            100
+        };
+        let target_mah = (target_pct as f64 / 100.0) * q_full;
+        let suffix = if target_pct < 100 {
+            format!("tot {target_pct}%")
+        } else {
+            "tot vol".into()
+        };
+        if q_rem >= target_mah {
+            return Some(if target_pct < 100 {
+                format!("bijna {target_pct}%")
+            } else {
+                "bijna vol".into()
+            });
+        }
+        // MTK linear charger pauses ~1 s per 10 s -> ~87% net CC rate; CV taper above 85% averages ~35%.
+        let cc_ma = (-i_ma * 0.87).max(50.0);
+        let cv_start = 0.85 * q_full;
+        let cc_mah = (target_mah.min(cv_start) - q_rem).max(0.0);
+        let cv_mah = (target_mah - q_rem.max(cv_start)).max(0.0);
+        let cv_ma = (cc_ma * 0.35).max(80.0);
+        let hours = cc_mah / cc_ma + cv_mah / cv_ma;
+        if !hours.is_finite() || hours > 99.0 {
+            return None;
+        }
+        let mins = (hours * 60.0).round() as i64;
+        return Some(format!("{} {suffix}", format_duration(mins)));
+    }
+    if (state == "Discharging" || state == "Cmd discharging") && i_ma > 20.0 {
+        // Wake-sampled current is slightly above sleep average (~80% continuous factor).
+        let disch_ma = (i_ma * 0.80).max(20.0);
+        let hours = q_rem.max(0.0) / disch_ma;
+        if !hours.is_finite() || hours > 99.0 {
+            return None;
+        }
+        let mins = (hours * 60.0).round() as i64;
+        return Some(format!("{} over", format_duration(mins)));
+    }
+    None
 }
 
 impl Paths {
@@ -104,12 +177,14 @@ impl Paths {
             Some(v) => format!("{:.2} V", v as f64 / 1000.0),
             None => "? V".into(),
         };
+        let eta = s.as_ref().and_then(|st| battery_eta(st, state));
         Battery {
             cap,
             state,
             word,
             current,
             volt,
+            eta,
         }
     }
 }
@@ -285,6 +360,35 @@ mod tests {
         assert_eq!(f.paths.battery_level(1000.0), "78");
         f.update(json!({"anchored": false, "level": 78}));
         assert_eq!(f.paths.battery_level(1000.0), "~78");
+    }
+
+    #[test]
+    fn battery_eta_estimates_charge_to_limit_full_and_discharge() {
+        let mut f = Fixture::new("eta");
+        // Charging at -660 mA from 2441/3650 mAh toward 80% limit (2920 mAh): ~479 mAh / 574 mA ≈ 50 min
+        f.update(json!({
+            "paused": false, "enabled": true, "limit": 80, "online": true,
+            "q_rem_mah": 2441.0, "q_full_mah": 3650.0, "activity": -6600
+        }));
+        let b = f.paths.battery(1000.0);
+        assert_eq!(b.eta.as_deref(), Some("~50 min tot 80%"));
+
+        // Charging to 100% (limit disabled): includes CV taper above 85%
+        f.update(json!({"enabled": false}));
+        let b_full = f.paths.battery(1000.0);
+        assert!(
+            b_full
+                .eta
+                .as_deref()
+                .is_some_and(|e| e.ends_with("tot vol") && e.starts_with("~3 u")),
+            "got {:?}",
+            b_full.eta
+        );
+
+        // Unplugged discharging at +120 mA from 2400 mAh -> ~25 u over
+        f.update(json!({"online": false, "activity": 1200, "q_rem_mah": 2400.0}));
+        let b_dis = f.paths.battery(1000.0);
+        assert_eq!(b_dis.eta.as_deref(), Some("~25 u over"));
     }
 
     #[test]
