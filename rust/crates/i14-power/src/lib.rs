@@ -3,24 +3,28 @@
 //! with the same status file, log lines, error texts and order of hardware writes.
 
 pub mod bcct;
+pub mod fuel_gauge;
 pub mod guard;
 pub mod py;
 
 pub use bcct::{Bcct, Control, Writer};
+pub use fuel_gauge::{Calibration, FgInput, FgOutput, FgSnapshot, FuelGauge, KmsgResetWatcher};
 pub use guard::{ocv_percent, Guard, Paths};
 pub use py::Error;
 
 use std::time::Duration;
 
 /// The service loop of charging.py's `main()` after the guard is built: tick every
-/// 60 s; on low battery release, record and run `poweroff`. Returns when `stop()`
-/// turns true (checked after each tick and while waiting) or after `poweroff`; the
-/// caller then runs `guard.close()`, Python's `finally`. Err: `poweroff` failed.
+/// 60 s (or 15 s when the HW-CAR fuel gauge is enabled); on low battery release, record
+/// and run `poweroff`. Returns when `stop()` turns true (checked after each tick and
+/// while waiting) or after `poweroff`; the caller then runs `guard.close()`, Python's
+/// `finally`. Err: `poweroff` failed.
 pub fn serve(
     guard: &mut Guard,
     stop: &dyn Fn() -> bool,
     poweroff: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
+    let period_s = guard.tick_period_s();
     loop {
         let low = guard.tick();
         if stop() {
@@ -31,8 +35,8 @@ pub fn serve(
             guard.record("low battery: powering off");
             return poweroff();
         }
-        // time.sleep(60), ended early by a stop request.
-        let end = i14_sys::monotonic() + 60.0;
+        // Sleep for period_s, ended early by a stop request.
+        let end = i14_sys::monotonic() + period_s;
         loop {
             if stop() {
                 return Ok(());

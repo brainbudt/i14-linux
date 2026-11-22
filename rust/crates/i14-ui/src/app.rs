@@ -430,6 +430,9 @@ impl Home {
             1,
             None,
         );
+        if let Some(eta) = &bat.eta {
+            c.text(40, BAR_H + 365, eta, &f.mid, w::DIM, w::BG, 1, None);
+        }
         c.text(40, BAR_H + 420, "Wi-Fi", &f.mid, w::ACCENT, w::BG, 1, None);
         let wifi_line = if !ssid.is_empty() {
             ssid.as_str()
@@ -2819,6 +2822,7 @@ pub(crate) mod tests {
                 word: "ontladen",
                 current: String::new(),
                 volt: String::new(),
+                eta: None,
             }
         }
         fn battery_level(&self) -> String {

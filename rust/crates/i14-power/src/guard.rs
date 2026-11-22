@@ -14,6 +14,10 @@ use i14_config::Config;
 use serde_json::{Number, Value};
 
 use crate::bcct::{self, Control, Writer};
+use crate::fuel_gauge::{
+    self, Calibration, FgInput, FgOutput, FuelGauge, KmsgResetWatcher, BCCT_HARD_CEILING_MV,
+    BCCT_RESUME_CEILING_MV,
+};
 use crate::py::{self, Error, Json};
 
 pub const BATTERY: &str = "/sys/class/power_supply/battery";
@@ -371,6 +375,10 @@ pub struct Guard {
     pub drain_until: Option<i64>,
     /// Last drain line logged (each is logged once).
     drain_note: Option<String>,
+    /// Optional HW-CAR coulomb-counter fuel gauge (enabled in production binary; None in legacy/parity mode).
+    pub fuel_gauge: Option<FuelGauge>,
+    kmsg: KmsgResetWatcher,
+    last_fg_out: Option<FgOutput>,
 }
 
 fn int(v: Option<&Value>) -> Option<i64> {
@@ -448,6 +456,25 @@ impl Guard {
             drain_owner: 0,
             drain_until: None,
             drain_note: None,
+            fuel_gauge: None,
+            kmsg: KmsgResetWatcher::disabled(),
+            last_fg_out: None,
+        }
+    }
+
+    /// Enable the hardware coulomb-counter (HW-CAR) fuel gauge with persistent state and `/dev/kmsg` reset watching.
+    pub fn enable_fuel_gauge(&mut self, state_path: PathBuf, cal_path: &Path, kmsg_path: &Path) {
+        let cal = Calibration::load_or_default(cal_path);
+        self.fuel_gauge = Some(FuelGauge::new(cal, state_path));
+        self.kmsg = KmsgResetWatcher::open(kmsg_path);
+    }
+
+    /// Polling cadence for `serve()`: 15 s with HW-CAR fuel gauge (matching 10 s `bat_thread`), 60 s in legacy mode.
+    pub fn tick_period_s(&self) -> f64 {
+        if self.fuel_gauge.is_some() {
+            15.0
+        } else {
+            60.0
         }
     }
 
@@ -526,6 +553,9 @@ impl Guard {
     }
 
     pub fn close(&mut self) {
+        if let Some(fg) = &self.fuel_gauge {
+            fg.persist_shutdown(&self.boot_id, (self.uptime)().filter(|v| v.is_finite()));
+        }
         let error = self.release();
         // A clean stop releases hardware; retire its measurement while retaining the migration latch.
         let now = (self.clock)();
@@ -664,6 +694,43 @@ impl Guard {
             && current.is_some();
         let mut valid = readings && voltage.is_some_and(|v| v > 3700);
         let now_up = (self.uptime)().filter(|v| v.is_finite());
+        let online = match (usb, ac) {
+            (Some(u), Some(a)) => Some(u != 0 || a != 0),
+            _ => None,
+        };
+        let mut fg_out: Option<FgOutput> = None;
+        let hw_car_mode = self.fuel_gauge.is_some();
+        if let Some(fg) = self.fuel_gauge.as_mut() {
+            let kmsg_reset = self.kmsg.poll_reset();
+            if let (Some(v_mv), Some(fg_snap)) = (
+                voltage,
+                fuel_gauge::read_fg_coherent(&self.paths.gauge, &self.paths.gauge_activity),
+            ) {
+                let out = fg.update(&FgInput {
+                    now_mono: now,
+                    boottime_s: now_up,
+                    boot_id: &self.boot_id,
+                    batt_vol_mv: v_mv,
+                    fg: fg_snap,
+                    online,
+                    kmsg_reset,
+                });
+                let ev_log = out.event.clone();
+                self.last_fg_out = Some(out.clone());
+                fg_out = Some(out);
+                if let Some(ev) = ev_log {
+                    self.record(&ev);
+                }
+            } else if let Some(prev) = &self.last_fg_out {
+                // Transient torn read: hold previous coherent FG output for this tick.
+                fg_out = Some(prev.clone());
+            }
+        }
+        let eff_gauge = if hw_car_mode {
+            fg_out.as_ref().map(|o| o.soc_pct)
+        } else {
+            gauge
+        };
         let (until, reason) = match drain_request(
             &self.paths.drain_request,
             &self.boot_id,
@@ -676,7 +743,16 @@ impl Guard {
         };
         self.drain_step(until, reason);
         let mut error = None;
-        if let Err(exc) = self.control_step(stopped, current, limit, valid, gauge, zcv) {
+        if let Err(exc) = self.control_step(
+            stopped,
+            current,
+            limit,
+            valid,
+            eff_gauge,
+            zcv,
+            voltage,
+            hw_car_mode,
+        ) {
             valid = false;
             self.record(&format!("ERROR charge control failed: {exc}"));
             let mut text = exc.0;
@@ -689,47 +765,67 @@ impl Guard {
             error = Some(text);
         }
         self.limit = Some(limit);
-        match (gauge, self.level) {
-            (Some(g), Some(level)) => {
-                if now - self.level_at.expect("set with level") >= 60.0 {
-                    // Voltage relaxation must not make the screen rise while paused/discharging.
-                    // Match the vendor UI idea: at most one point per minute in the flow direction.
-                    self.level = Some(if self.paused || activity.expect("live gauge") >= 0 {
-                        level.min(g.max(level - 1))
-                    } else {
-                        level.max(g.min(level + 1))
-                    });
+        if hw_car_mode {
+            // In HW-CAR mode, `level` is the direct coulomb-counter SOC (paired with `zcv` for schema-1).
+            self.level = if zcv.is_some() { eff_gauge } else { None };
+        } else {
+            match (gauge, self.level) {
+                (Some(g), Some(level)) => {
+                    if now - self.level_at.expect("set with level") >= 60.0 {
+                        // Voltage relaxation must not make the screen rise while paused/discharging.
+                        // Match the vendor UI idea: at most one point per minute in the flow direction.
+                        self.level = Some(if self.paused || activity.expect("live gauge") >= 0 {
+                            level.min(g.max(level - 1))
+                        } else {
+                            level.max(g.min(level + 1))
+                        });
+                    }
                 }
+                _ => self.level = gauge,
             }
-            _ => self.level = gauge,
         }
         self.level_at = Some(now);
         let state = (self.paused, valid, limit, enabled, error.clone());
-        if self.previous.as_ref() != Some(&state) || self.n.is_multiple_of(5) {
+        let log_every = if hw_car_mode { 20 } else { 5 }; // ~5 min in both 15 s and 60 s modes
+        if self.previous.as_ref() != Some(&state) || self.n.is_multiple_of(log_every) {
             let show = |v: Option<i64>| v.map_or("None".to_string(), |v| v.to_string());
-            self.record(&format!(
-                "capacity={} gauge={} zcv={} status={status} voltage={} usb_unlimited=0 limit={limit} enabled={} \
-                 discharge={} valid={} backend=bcct",
-                show(cap),
-                show(gauge),
-                show(zcv),
-                show(voltage),
-                enabled as u8,
-                self.paused as u8,
-                valid as u8
-            ));
+            if let Some(out) = &fg_out {
+                self.record(&format!(
+                    "capacity={} gauge={} anchored={} q_rem={:.0}/{:.0} ocv={} zcv={} status={status} voltage={} usb_unlimited=0 limit={limit} enabled={} \
+                     discharge={} valid={} backend=bcct",
+                    show(cap),
+                    out.soc_pct,
+                    out.anchored as u8,
+                    out.q_rem_mah,
+                    out.q_full_mah,
+                    out.ocv_mv,
+                    show(zcv),
+                    show(voltage),
+                    enabled as u8,
+                    self.paused as u8,
+                    valid as u8
+                ));
+            } else {
+                self.record(&format!(
+                    "capacity={} gauge={} zcv={} status={status} voltage={} usb_unlimited=0 limit={limit} enabled={} \
+                     discharge={} valid={} backend=bcct",
+                    show(cap),
+                    show(gauge),
+                    show(zcv),
+                    show(voltage),
+                    enabled as u8,
+                    self.paused as u8,
+                    valid as u8
+                ));
+            }
         }
-        let online = match (usb, ac) {
-            (Some(u), Some(a)) => Some(u != 0 || a != 0),
-            _ => None,
-        };
-        self.publish(&[
+        let mut fields: Vec<(&str, Json)> = vec![
             ("schema", 1i64.into()),
             ("backend", "bcct".into()),
             ("boot_id", self.boot_id.as_str().into()),
             ("updated_monotonic", now.into()),
             ("level", self.level.into()),
-            ("raw_level", gauge.into()),
+            ("raw_level", eff_gauge.into()),
             ("zcv_mv", zcv.into()),
             ("paused", self.paused.into()),
             ("valid", valid.into()),
@@ -749,7 +845,18 @@ impl Guard {
             ("activity_car", self.activity_car.into()),
             ("drain", self.drain_until.is_some().into()),
             ("drain_until", self.drain_until.into()),
-        ]);
+        ];
+        if let Some(out) = &fg_out {
+            fields.push(("anchored", out.anchored.into()));
+            fields.push(("q_rem_mah", ((out.q_rem_mah * 10.0).round() / 10.0).into()));
+            fields.push((
+                "q_full_mah",
+                ((out.q_full_mah * 10.0).round() / 10.0).into(),
+            ));
+            fields.push(("ocv_mv", out.ocv_mv.into()));
+            fields.push(("gauge_mode", "hw_car".into()));
+        }
+        self.publish(&fields);
         self.previous = Some(state);
         self.n += 1;
         let low = if status == "Charging" || status == "Full" {
@@ -757,10 +864,12 @@ impl Guard {
         } else {
             5
         };
-        cap.is_some_and(|c| c <= low)
+        let fg_low = fg_out.as_ref().is_some_and(|o| o.safety_poweroff);
+        fg_low || cap.is_some_and(|c| c <= low)
     }
 
     /// The `try:` body of charging.py's tick.
+    #[allow(clippy::too_many_arguments)]
     fn control_step(
         &mut self,
         stopped: Option<&str>,
@@ -769,6 +878,8 @@ impl Guard {
         valid: bool,
         gauge: Option<i64>,
         zcv: Option<i64>,
+        voltage: Option<i64>,
+        hw_car_mode: bool,
     ) -> Result<(), Error> {
         let (Some(stopped), Some(current)) = (stopped, current) else {
             return Err(Error::value("charger feedback unavailable"));
@@ -797,13 +908,24 @@ impl Guard {
             if self.limit.is_some_and(|l| l != limit) {
                 paused = false;
             }
-            let (gauge, zcv) = (gauge.unwrap_or(0), zcv.unwrap_or(0)); // only used when valid (both known)
-            if !valid || gauge <= 15 {
-                paused = false;
-            } else if zcv >= ocv(limit) {
-                paused = true;
-            } else if zcv <= ocv(limit - 10) {
-                paused = false;
+            if hw_car_mode {
+                let (soc, v_mv) = (gauge.unwrap_or(0), voltage.unwrap_or(0));
+                if !valid || gauge.is_none() || soc <= 15 || v_mv <= 3700 {
+                    paused = false;
+                } else if limit < 100 && (soc >= limit || v_mv >= BCCT_HARD_CEILING_MV) {
+                    paused = true;
+                } else if soc <= limit - 10 && v_mv < BCCT_RESUME_CEILING_MV {
+                    paused = false;
+                }
+            } else {
+                let (gauge, zcv) = (gauge.unwrap_or(0), zcv.unwrap_or(0)); // only used when valid (both known)
+                if !valid || gauge <= 15 {
+                    paused = false;
+                } else if zcv >= ocv(limit) {
+                    paused = true;
+                } else if zcv <= ocv(limit - 10) {
+                    paused = false;
+                }
             }
         }
         if paused != self.control.paused()? {

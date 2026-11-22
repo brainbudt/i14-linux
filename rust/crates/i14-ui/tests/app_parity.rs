@@ -171,6 +171,7 @@ impl Env for FakeEnv {
             word: "ontladen",
             current: "-150 mA".into(),
             volt: "3.71 V".into(),
+            eta: None,
         }
     }
     fn battery_level(&self) -> String {
