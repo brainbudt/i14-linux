@@ -5,7 +5,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::{self, Command};
 
-use i14_power::{guard, serve, Bcct, Guard, Paths};
+use i14_power::{fuel_gauge, guard, serve, Bcct, Guard, Paths};
 
 fn path(var: &str, default: &str) -> PathBuf {
     env::var_os(var).map_or_else(|| default.into(), PathBuf::from)
@@ -32,6 +32,12 @@ fn main() {
         Box::new(Bcct::default()),
         Box::new(i14_sys::monotonic),
     );
+    if env::var("I14_LEGACY_GAUGE").as_deref() != Ok("1") {
+        let state_path = path("I14_BATTERY_STATE", fuel_gauge::STATE_PATH);
+        let cal_path = path("I14_BATTERY_CAL", fuel_gauge::CAL_PATH);
+        let kmsg_path = path("I14_KMSG", fuel_gauge::KMSG_PATH);
+        guard.enable_fuel_gauge(state_path, &cal_path, &kmsg_path);
+    }
     // As in Python, the handlers are installed once the guard exists.
     i14_sys::term_signal::install(); // SIGTERM and SIGINT
     let stop = i14_sys::term_signal::requested;

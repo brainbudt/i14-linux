@@ -32,6 +32,8 @@ pub struct ChargeStatus {
     pub limit: i64,
     pub error: Option<String>,
     pub online: Option<bool>,
+    /// True when `level` comes from an anchored HW coulomb counter (display `N%`, not `~N%`).
+    pub anchored: bool,
     /// The whole snapshot, for fields only the guard uses.
     pub raw: Map<String, Value>,
 }
@@ -90,6 +92,11 @@ pub fn parse(text: &str, now: f64, boot_id: &str, max_age: Option<f64>) -> Optio
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return None,
     };
+    let anchored = match data.get("anchored") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return None,
+    };
     if level.is_none() != zcv_mv.is_none() {
         return None;
     }
@@ -102,6 +109,7 @@ pub fn parse(text: &str, now: f64, boot_id: &str, max_age: Option<f64>) -> Optio
         limit,
         error,
         online,
+        anchored,
         raw: data,
     })
 }

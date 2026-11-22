@@ -48,8 +48,9 @@ pub fn py_int(s: &str) -> Option<i64> {
 }
 
 pub fn level_text(s: Option<&ChargeStatus>) -> String {
-    match s.and_then(|s| s.level) {
-        Some(l) => format!("~{l}"),
+    match s.and_then(|s| s.level.map(|l| (l, s.anchored))) {
+        Some((l, true)) => format!("{l}"),
+        Some((l, false)) => format!("~{l}"),
         None => "?".into(),
     }
 }
@@ -273,6 +274,17 @@ mod tests {
         );
         assert_eq!(f.paths.battery_level(1000.0), "~80");
         assert_eq!((b.current.as_str(), b.volt.as_str()), ("+600 mA", "4.05 V"));
+    }
+
+    #[test]
+    fn anchored_status_displays_exact_percent_without_tilde() {
+        let mut f = Fixture::new("anchored");
+        f.update(json!({"anchored": true, "level": 78}));
+        let b = f.paths.battery(1000.0);
+        assert_eq!(b.cap.as_str(), "78");
+        assert_eq!(f.paths.battery_level(1000.0), "78");
+        f.update(json!({"anchored": false, "level": 78}));
+        assert_eq!(f.paths.battery_level(1000.0), "~78");
     }
 
     #[test]
