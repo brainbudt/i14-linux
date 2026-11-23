@@ -73,7 +73,7 @@ def load_records(path):
         lines.pop()
     records, problems = [], []
     for number, line in enumerate(lines, 1):
-        if len(records) >= MAX_RECORDS:
+        if number > MAX_RECORDS:
             problems.append({"line": number, "reason": "too_many_records"})
             break
         if line.strip() == "":
@@ -106,6 +106,7 @@ def new_result():
 def analyze_stages(records, boot_id):
     """Pair optional stage records on the returned boot's uptime clock only."""
     starts, ends, issues, seen = {}, {}, [], False
+    ambiguous = set()
     for number, record in records:
         if record["type"] != "stage":
             continue
@@ -130,10 +131,13 @@ def analyze_stages(records, boot_id):
         bucket = starts if record["phase"] == "start" else ends
         if name in bucket:
             issues.append(dict(issue, reason="duplicate_stage_" + record["phase"]))
+            ambiguous.add(name)
             continue
         bucket[name] = (record["t_s"], number)
     stages = []
     for name in STAGE_ORDER:
+        if name in ambiguous:
+            continue
         if name in starts and name in ends:
             (start, _), (end, end_line) = starts[name], ends[name]
             if end < start:
@@ -174,6 +178,9 @@ def evaluate(records, problems):
     contract, contract_line = single("contract", "missing_contract", "duplicate_contract")
     if contract is not None and (
             contract.get("schema") != SCHEMA
+            or ("previous_production_boot_id" in contract and
+                (not is_str(contract["previous_production_boot_id"]) or
+                 contract["previous_production_boot_id"] == contract.get("experimental_boot_id")))
             or not all(is_str(contract.get(key)) for key in
                        ("host_clock_session", "experimental_boot_id",
                         "expected_kernel", "expected_image"))):
@@ -182,7 +189,9 @@ def evaluate(records, problems):
 
     crash, crash_line = single("crash_trigger", "missing_crash_trigger", "duplicate_crash_trigger")
     if crash is not None:
-        if crash.get("clock") != "host_monotonic":
+        if "method" in crash and crash["method"] not in ("sysrq-crash", "keeper-stop"):
+            problem(crash_line, "unknown_trigger_method")
+        elif crash.get("clock") != "host_monotonic":
             problem(crash_line, "crash_clock_domain")
         elif not (is_str(crash.get("session")) and is_str(crash.get("boot_id"))
                   and is_num(crash.get("t_s"))):
@@ -225,6 +234,8 @@ def evaluate(records, problems):
                     problem(ret_line, "kernel_mismatch")
                 if ret["image"] != contract["expected_image"]:
                     problem(ret_line, "image_mismatch")
+                if ret["boot_id"] == contract.get("previous_production_boot_id"):
+                    problem(ret_line, "previous_production_boot")
             experimental = (contract["experimental_boot_id"] if contract is not None
                             else crash.get("boot_id") if crash is not None else None)
             if is_str(experimental) and ret["boot_id"] == experimental:
@@ -239,14 +250,17 @@ def evaluate(records, problems):
         result["exit_code"] = EXIT_CODES[result["verdict"]]
         return result
 
-    duration = round(ret["t_s"] - crash["t_s"], 6)
+    duration = ret["t_s"] - crash["t_s"]
     result["recovery"] = {"clock": "host_monotonic",
                           "host_clock_session": contract["host_clock_session"],
                           "crash_trigger_s": crash["t_s"],
-                          "production_return_s": ret["t_s"], "duration_s": duration,
+                          "production_return_s": ret["t_s"], "duration_s": round(duration, 6),
+                          "duration_unrounded_s": duration,
                           "from_boot_id": crash["boot_id"], "to_boot_id": ret["boot_id"],
                           "kernel": ret["kernel"], "image": ret["image"],
                           "kernel_confirmed": True, "image_confirmed": True}
+    if "method" in crash:
+        result["recovery"]["trigger_method"] = crash["method"]
     result["verdict"] = "WITHIN_LIMIT" if duration <= LIMIT_S else "OVER_LIMIT"
     stages, stage_issues, evidence = analyze_stages(records, ret["boot_id"])
     result["stages"] = stages
