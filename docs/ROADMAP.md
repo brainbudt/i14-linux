@@ -30,6 +30,9 @@ firmware dumps, images, credentials and raw captures outside Git.
 
 ### Unattended collector & 48-hour Soak C (H2/H3)
 
+The [H1, Soak C and H3 execution sequence](verification/H1-SOAK-C.md) lists
+the commissioning steps, commands and evidence required for these gates.
+
 - Commission a phone-local collector and export path with bounded retention and
   clean process teardown before starting a 48-hour acceptance window.
 - Freeze exact boot/rootfs identity, runtime hashes, sampler and probe settings,

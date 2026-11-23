@@ -154,10 +154,12 @@ class OwnerTests(unittest.TestCase):
 
     def test_idle_always_requests_fresh_process_for_both_implementations(self):
         instance=owner.Owner.__new__(owner.Owner);instance.h1=SimpleNamespace(light=lambda:0)
-        instance.ready=mock.Mock();instance.select=mock.Mock(return_value={'child':{'pid':42}})
-        with mock.patch.object(owner,'payload'):
+        instance.ready=mock.Mock();instance.select=mock.Mock(return_value={'child':{'pid':42,'start_ticks':912}})
+        with mock.patch.object(owner,'payload') as measure:
             instance.idle('ui','rust',Path('/run/h1-idle.json'))
         instance.select.assert_called_once_with('ui','rust',restart=True)
+        argv = measure.call_args.args[0]
+        self.assertEqual(argv[argv.index('--start-ticks') + 1], '912')
 
     def test_measurement_failure_stops_after_logging_payload_status(self):
         self.assertIsNotNone(owner)
