@@ -1460,10 +1460,18 @@ fn differential_receipt_matches_v9_evidence_shape() {
     if !stock_present() {
         return;
     }
-    let evidence = std::fs::read_to_string(format!(
-        "{PROJECT}/evidence/2026-11-04/i14-boot-install/attempt-v9b.jsonl"
-    ))
-    .unwrap();
+    let path = Path::new(PROJECT).join("evidence/2026-11-04/i14-boot-install/attempt-v9b.jsonl");
+    let evidence = match std::fs::read_to_string(&path) {
+        Ok(evidence) => evidence,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "skipped receipt comparison: {} missing (local evidence)",
+                path.display()
+            );
+            return;
+        }
+        Err(err) => panic!("reading {}: {err}", path.display()),
+    };
     let dir = canonical_dir("v9shape");
     let scenario = install(
         img(json!({})),

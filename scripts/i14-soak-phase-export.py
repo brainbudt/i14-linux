@@ -18,7 +18,7 @@ DEPS = {
     'i14-soak-observer-inventory.py': '4a7973e96c1e3063e45def3e0efb2ef69c919f3384aad19caa9a2d00e6f5891c',
 }
 SOURCES = {
-    'i14-soak-local-collector.py': 'f2aed0de2044aa041a4af4bc9dbd598d45a77e5b052b7362e9848532d495e231',
+    'i14-soak-local-collector.py': 'bd202328ed4cc6611d6fa5e72d99159eaabc4f6127d96105203768b3090a6b0c',
     'i14-soak-observer-inventory.py': DEPS['i14-soak-observer-inventory.py'],
     'procs.sh': '32bc698ce56a958045bf6b63ff0588a0c1287e9f47007c6789d1314aa80def9d',
 }
@@ -64,7 +64,7 @@ def actors(root):
     with os.scandir('/proc') as entries:
         for i, entry in enumerate(entries):
             if i >= 4096:
-                raise ValueError('process enumeration exceeds4096')
+                raise ValueError('process enumeration exceeds 4096')
             if entry.name.isdigit():
                 try:
                     parts = fixed(Path(entry.path)/'cmdline', 65536).split(b'\0')
@@ -130,7 +130,7 @@ def stream_phase(bundle, dependency_sources, stream, clock):
         raise ValueError('invalid expected boot')
     start, end = bundle['start_epoch'], bundle['deadline_epoch']
     if any(type(x) not in (int, float) or not math.isfinite(x) for x in [start, end]) or not 0 < end-start <= 900:
-        raise ValueError('export grant exceeds0..900s')
+        raise ValueError('export grant exceeds 0..900s')
     def time_guard():
         now = clock()
         if not math.isfinite(now) or not start <= now < end:

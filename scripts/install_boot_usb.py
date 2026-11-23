@@ -23,8 +23,10 @@ def validate_install_cmdline(data):
     """Check both NUL-terminated command-line fields of the legacy v0 header."""
     for start, end in ((64, 576), (608, 1632)):
         for word in data[start:end].split(b"\0", 1)[0].split():
-            if word.startswith(TEST_CMDLINE_PREFIXES):
-                raise FastbootError("RAM-boot-only test image; never install it")
+            for prefix in TEST_CMDLINE_PREFIXES:
+                if word.startswith(prefix):
+                    shown = word if len(word) <= 64 and all(33 <= c <= 126 for c in word) else prefix
+                    raise FastbootError(f"RAM-boot-only test image ({shown.decode('ascii')}); never install it")
 
 
 def validate_stock(data):

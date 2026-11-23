@@ -78,7 +78,8 @@ class InstallTests(unittest.TestCase):
                                     hashlib.sha256(data).hexdigest(), "--stock-backup", str(stock),
                                     "--attempt", str(attempt)])
                             self.assertEqual(status, 1)
-                            self.assertIn("RAM-boot-only", error.getvalue())
+                            self.assertIn(f"RAM-boot-only test image ({word.decode('ascii')}); never install it",
+                                          error.getvalue())
                             connector.assert_not_called()
                             self.assertFalse(attempt.exists())
                         device = Device([])
@@ -86,6 +87,19 @@ class InstallTests(unittest.TestCase):
                         with self.assertRaisesRegex(fb.FastbootError, "RAM-boot-only"):
                             installer.install_boot(fb.Fastboot(device), data, lambda *_a, **_kw: None)
                         self.assertEqual(device.writes, [])
+
+    def test_ram_only_diagnostic_limits_the_displayed_word(self):
+        prefix = b"i14.test="
+        limit = prefix.ljust(64, b"x")
+        for word, shown in ((limit, limit), (limit + b"x", prefix),
+                            (prefix + b"\x1b", prefix), (prefix + b"\xff", prefix)):
+            data = bytearray(image())
+            data[64:64 + len(word)] = word
+            with self.subTest(word=word):
+                with self.assertRaises(fb.FastbootError) as error:
+                    installer.validate_install_cmdline(data)
+                self.assertEqual(str(error.exception),
+                                 f"RAM-boot-only test image ({shown.decode('ascii')}); never install it")
 
     def test_stock_backup_must_match_pinned_full_partition(self):
         for stock in (b"", b"x" * 16384, b"\0" * 0x1000000):

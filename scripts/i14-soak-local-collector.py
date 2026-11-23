@@ -245,7 +245,7 @@ def main(argv=None):
         raise ValueError('observer directory is not a dedicated userdata child')
     info = root.stat()
     if os.geteuid() != 0 or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ValueError('observer must run as root in own0700 directory')
+        raise ValueError('observer must run as root in own 0700 directory')
     boot = runtime_identity()
     config, config_sha = load_config(root)
     if 'boot_id' in config and config['boot_id'] != boot:
@@ -293,7 +293,7 @@ def main(argv=None):
             previous_handlers[number] = signal.signal(number, interrupted)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         signal.alarm(40)
-        # Existing minute probes may take5s; collect after their initial write burst.
+        # Existing minute probes may take 5s; collect after their initial write burst.
         time.sleep(7)
         # Refuse stale pre-lock count/space/expiry after a competing capture finishes.
         if os.path.lexists(root / 'STOPPED.json'):
