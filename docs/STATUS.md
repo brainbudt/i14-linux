@@ -1,13 +1,10 @@
-# Current status — 22 November 2026
+# Current status — 23 November 2026
 
-This overview covers the Topiky/I14 device examined by this project. It separates
-the historical 2–5 November v9 runtime baseline ([runtime check](verification/2026-11-05-runtime.txt)),
-narrower later device measurements (13 November v10c capture, 18 November
-userdata cleanup, and 19 November UI maintenance), and source/host-tooling
-milestones integrated on `main` through 22 November 2026.
-Window B was accepted for its measured version; the 48-hour Soak C test remains
-open. Source merges, host tests, and CI builds do not establish that a change
-has been deployed to or accepted on the phone.
+The latest device check covered the v10c/B5 installation on 23 November. The
+[2–5 November v9 runtime check](verification/2026-11-05-runtime.txt) remains
+the baseline for features outside that check. Window B passed for its measured
+version. Soak C collector commissioning passed on B5. The uninterrupted
+48-hour window and post-soak H3 measurements remain open.
 
 ## Current installation (latest recorded device state)
 
@@ -27,7 +24,38 @@ has been deployed to or accepted on the phone.
   full-image hash; the prior full B5 content hash is therefore historical and
   does not describe every currently installed UI file.
 
-## Source and host-tooling milestones on `main` (not yet device-accepted)
+### 23 November B5 verification
+
+- **Installed binaries.** All six programs in `/usr/libexec/i14-rs/`
+  (`i14-battery-guard`, `i14-cpufreq`, `i14-netwatch`, `i14-reboot-bootloader`,
+  `i14-splash`, `i14-ui`) and `/mnt/data/media/0/i14-linux/soak/i14-soak-sample-rs`
+  matched the ARM64 musl release SHA-256 hashes. The build used `9d3d781`,
+  whose Rust sources match the `main` merge `fb00a71`. Three binaries needed
+  replacement. The `.pre-20261123` rollback copies of `i14-cpufreq`, `i14-splash`
+  and `i14-ui` matched their pre-deployment hashes.
+- **Services and DNS.** All 12 default OpenRC services reported `[ started ]`.
+  All four supervised Rust daemons were running the verified binaries.
+  `i14-probe` passed 8/8 checks on hardware. Local Unbound answered
+  `i14-health.invalid` with `192.0.2.1`. The installed `unbound-1.25.2-r2`
+  lacks the fixes for CVE-2026-81634 and CVE-2026-96405. Keep
+  `dns-clients.conf` empty for acceptance until the candidate manifest
+  confirms both fixes. [Package details](DEVELOPMENT.md).
+- **Battery gauge and home-screen ETA.** PR #2 merged on 22 November and was
+  deployed on B5. Both 23 November snapshots reported `gauge_mode: "hw_car"`.
+  The hardware coulomb counter tracked remaining charge (`q_rem_mah`) against
+  an estimated full capacity (`q_full_mah`). Both reported `anchored: false`,
+  so the UI keeps the estimate marker (`~N%`) until the gauge records an
+  anchor, then displays `N%`. Bounded two-cycle C13 calibration remains open.
+  The home screen estimates time to the charge limit or time remaining on
+  discharge. Replaying the two snapshots on the host produced discharge ETAs.
+  The SSH check did not observe or photograph the screen.
+- **Soak C commissioning.** Root `crond` ran a bounded capture (`PASS`, exit 0).
+  The original root crontab was restored byte-for-byte, with no collector
+  process or lock left behind. [The phase exporter](../scripts/i14-soak-phase-export.py)
+  streamed the capture with `--stream`, and [the receiver](../scripts/i14-soak-receive.py)
+  verified all 18 files (9,715,485 bytes) against their hashes.
+
+## Source and host-tooling milestones
 
 - **Security hardening in source** (PR #11): locally activated, authenticated
   USB rescue; normal USB management restricted to SSH keys; fail-closed
@@ -42,6 +70,16 @@ has been deployed to or accepted on the phone.
   Linux 7 recovery timing analysis, offline raw-data audit for acceptance
   window B (`scripts/i14-window-audit.py`), and bounded C13 battery calibration
   tools.
+- **Acceptance tooling on main** (PR #3) added offline rootfs trial staging and
+  rollback verification, paired H1 sample checks, the Soak C observer and
+  streaming export/receiver, C13 launcher storage and deadline checks, M0
+  host timing anchors, and matching fastboot installer diagnostics.
+- **Additional host tools.** The [offline DNS/power correlator](../scripts/i14-soak-correlate.py)
+  processed 200 recorded B5 power samples with 199/199 usable intervals in a
+  smoke test using synthetic DNS answers. [Correlator guide](SOAK-CORRELATE.md).
+  The Rust `i14-make-android-props`
+  writer in `rust/crates/i14-tools` produced a byte-identical 128 KiB property
+  area for the same input as [the Python writer](../rootfs/make-android-props.py).
 - **CI and host-test hardening**: `.github/workflows/ci.yml` runs Python
   lint/tests, boot-install and initramfs tests, Rust formatting/Clippy/tests,
   and ARM64 musl builds on GitHub-hosted `ubuntu-latest`, with deterministic UI
@@ -50,8 +88,7 @@ has been deployed to or accepted on the phone.
 ## Features (historical 2–5 November v9 baseline)
 
 The table below reflects the 2–5 November v9 runtime baseline and has not been
-fully re-verified end to end after the v10c/B5 updates. Window B was later
-accepted for its measured version; the 48-hour Soak C test remains open.
+fully re-verified end to end after the v10c/B5 updates. The later B5 checks are recorded above.
 
 | Component | Working | Notes |
 | --- | --- | --- |
@@ -69,7 +106,7 @@ accepted for its measured version; the 48-hour Soak C test remains open.
 | Bluetooth | Partially | Radio and classic/BLE scanning tested; pairing, audio and file transfer are not implemented |
 | Charging | Yes, on 3.18 | Demonstrated in Linux and in the custom powered-off charging mode |
 | Charge limit | Partially | BCCT stop/resume actuator, guard crash, clean stop and actual reboot tested. A full unchanged 80% charge-band cycle and hysteresis after a crash inside the band remain open |
-| Battery gauge | Estimate only | `~N%` uses estimated open-circuit voltage and a generic stock profile. No calibrated capacity or exact state of charge; the earlier raw 100% reading was unreliable |
+| Battery gauge | Voltage estimate on v9 | The v9 display used an open-circuit voltage estimate. B5 now runs the HW-CAR gauge described above. |
 | CPU control | Yes | Downclocking to 299 MHz at idle with screen off, higher clocks under activity. A/B/A testing did not establish energy savings |
 | Automatic startup after charging | Partially | Return from custom charging mode tested with substantial charge remaining. An actual nearly-empty → charging → unattended Linux cycle was skipped at the owner's request and remains unproven |
 | Audio | Not verified as a user feature | DMA playback test had no underruns; audible output, mixer routing and Bluetooth audio have not been demonstrated |
@@ -80,12 +117,12 @@ accepted for its measured version; the 48-hour Soak C test remains open.
 
 ## Priorities
 
-1. Verify device baseline and deploy/accept the security-hardened stock-kernel image; keep the DNS client list empty until the candidate build manifest confirms the applicable Unbound fixes (see [DEVELOPMENT.md](DEVELOPMENT.md)).
+1. Deploy and accept the hardened stock boot image and rootfs together (authenticated USB rescue, fail-closed firewall, settings directory `0700` and files `0600`). Keep the DNS client list empty until the candidate build manifest confirms the applicable Unbound fixes (see [DEVELOPMENT.md](DEVELOPMENT.md)).
 2. Complete paired H1 Rust/Python performance measurements and resolve the new rootfs candidate (R), currently in `KEEP_B5 / R_DEFERRED_INTEGRITY`, with carry and automatic rollback verification.
-3. Commission unattended collection and run the uninterrupted 48-hour Soak C test (H2/H3) on one frozen software version (Window B was accepted for its measured version; Soak C remains open).
-4. Run a full natural charge-band cycle, bounded C13 battery calibration (rechecking free space first, as a 3 GiB R staging image can drop userdata below the 2 GiB floor again), and crash-in-band hysteresis checks.
+3. Run the uninterrupted 48-hour Soak C window on one frozen version, then collect the read-only H3 Rust measurements.
+4. Run a full natural 80% charge-band cycle, bounded two-cycle C13 battery calibration (rechecking free space first, as a 3 GiB R staging image can drop userdata below the 2 GiB floor again), and crash-in-band hysteresis checks.
 5. Keep nearly-empty → charging → unattended Linux recovery (D) on hold until explicit new owner direction reopens it.
-6. Continue Linux 7 mainline recovery (M0) and charging work as a separate track; do not attribute 3.18 results to it.
+6. Linux 7 mainline recovery (M0) remains a separate track. The recorded return took 70.6 s against a 40 s limit.
 
 See [the roadmap](ROADMAP.md) for the full entry gates and closure criteria.
 

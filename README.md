@@ -34,9 +34,9 @@ that specific device and motherboard (`magc6735_65u_1_m0`, firmware branch `P45`
   <img src="assets/screenshots/settings.png" width="260" alt="Settings for brightness, screen timeout, PIN and estimated charge limit">
 </p>
 
-Unmodified framebuffer captures from the device: the boot screen and settings
-with the charge limit. `~80%` is an estimate based on open-circuit voltage,
-not an independently calibrated state of charge. The original interface is in Dutch.
+These earlier framebuffer captures show the boot screen and charge-limit settings.
+The `~80%` label in the screenshot comes from the voltage-based interface
+that preceded the HW-CAR fuel gauge. The original interface is in Dutch.
 [Screenshot provenance and limitations](docs/SCREENSHOTS.md).
 
 ## Why this project?
@@ -55,10 +55,11 @@ malicious behavior. [A short history](docs/HISTORY.md).
 
 ## What works now?
 
-Status: **22 November 2026** (separating the historical 2–5 November v9 baseline,
-later v10c/B5 device checks, and source-only hardening/Rust tooling). “Yes” means
-demonstrated on this device; [the detailed status](docs/STATUS.md) describes the
-exact tests and limitations.
+On **23 November 2026**, all six Rust programs in B5's `/usr/libexec/i14-rs/`
+and its soak sampler matched the ARM64 musl release hashes. All 12 default
+OpenRC services and four supervised Rust daemons were running. The hardware
+probe passed 8/8 checks. Earlier tests still supply the evidence for several
+features below. [Dated checks and limitations](docs/STATUS.md).
 
 | Component | Working | Notes |
 | --- | --- | --- |
@@ -66,17 +67,25 @@ exact tests and limitations.
 | Display and touch controls | Yes | Custom framebuffer interface and on-screen keyboard |
 | On-device terminal | Historical / disabled in hardened DNS image | Exercised in the 2–5 Nov v9 baseline; disabled in the hardened DNS image on `main` (see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)) |
 | Wi-Fi and SSH | Yes | On-screen network selection and SSH key authentication |
-| USB management and rescue mode | Yes | USB networking (`172.16.42.1`) and rescue mode; hardened source restricts normal USB management to SSH keys and uses locally activated, authenticated serial rescue |
-| Backup DNS | Yes | Tested on UDP/TCP port 53, with DNS-over-TLS and DNSSEC; verify Unbound security advisories before exposing to LAN clients (see [SECURITY.md](SECURITY.md)) |
+| USB management and rescue mode | Yes | USB networking and rescue mode; hardened source restricts normal USB management to SSH keys and uses locally activated, authenticated serial rescue |
+| Backup DNS | Local health check passed | B5 answered `i14-health.invalid` with `192.0.2.1`. Keep the candidate DNS client list empty until the installed Unbound security gaps are fixed. [Security policy](SECURITY.md). |
 | Brightness, screen timeout, PIN and power menu | Yes | Implemented and exercised on the device |
 | Charging and configurable charge limit | Partially | Charging works; BCCT pause/resume tested, full calibration/charge-band acceptance still pending |
+| Battery gauge and home-screen ETA | Deployed on B5 | The HW-CAR coulomb counter tracks remaining charge. The UI estimates time to the charge limit or time left on discharge. |
 | CPU control with the screen off | Yes | Downclocking works; energy savings have not been established |
-| Rust userspace & host tools | Source / host-verified | 12-crate workspace (`rust/`) with offline backup verifier (`i14-verify-backup`) and ARM64 musl builds; full on-device migration acceptance open |
+| Rust userspace & host tools | Phone binaries verified on B5 | The UI, charge guard, CPU controller and netwatch ran under OpenRC supervision. Paired Rust/Python performance measurements remain open. |
 | Bluetooth | Partially | Radio and scanning work; pairing and device use are not implemented |
 | Audio, camera, GPS, calls and mobile data | Not verified | No complete, accepted Linux support |
 | Modern mainline kernel | Partially | Earlier native boot demonstrated; not a complete replacement for 3.18 |
 | Docker | No | Not supported by the current kernel |
-| Multi-day reliability / recovery from an empty battery | Partially | Acceptance window B passed for its measured version; 48-hour Soak C and nearly-empty recovery remain open |
+| Multi-day reliability / recovery from an empty battery | Partially | Window B passed for its measured version. Soak C collector commissioning passed on 23 November. The uninterrupted 48-hour window and post-soak H3 measurements remain open. Nearly-empty recovery is on owner hold. |
+
+On 23 November the gauge reported `gauge_mode: "hw_car"`, remaining charge
+(`q_rem_mah`) and estimated full capacity (`q_full_mah`). Both snapshots
+reported `anchored: false`. The UI shows `~N%` until the gauge records an
+anchor, then `N%`. Replaying those snapshots on the host produced discharge
+ETAs. The SSH check did not observe the screen. Two-cycle C13 calibration
+remains open.
 
 ## How does it work?
 
@@ -117,6 +126,7 @@ Building requires additional tools and files from the device itself.
 - [History and suspicious preinstalled software](docs/HISTORY.md)
 - [Screenshots and provenance](docs/SCREENSHOTS.md)
 - [Development environment and build limitations](docs/DEVELOPMENT.md)
+- [Offline DNS and power soak correlator](docs/SOAK-CORRELATE.md)
 - [Rootfs trial and rollback](docs/ROOTFS-SWAP-ROLLBACK.md)
 - [K70 recovery-timing analyzer](docs/K70-RECOVERY-TIMING.md)
 - [Security policy](SECURITY.md)
