@@ -254,6 +254,13 @@ class Calibration(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "deadline"):
             cal.Cycle("boot-a", 0).step(self.sample(32*3600))
 
+    def test_full_window_completed_after_eight_hours_cannot_start_discharge(self):
+        deadline = 8 * 3600
+        for now in range(deadline - 299, deadline, 30):
+            self.cycle.step(self.sample(now))
+        with self.assertRaisesRegex(ValueError, "full-charge deadline"):
+            self.cycle.step(self.sample(deadline + 1))
+
     def test_bcct_pause_must_be_in_force_during_discharge(self):
         self.full()
         with self.assertRaisesRegex(ValueError, "BCCT"):

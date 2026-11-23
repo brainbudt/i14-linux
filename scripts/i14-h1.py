@@ -71,6 +71,14 @@ def idle_result(before, after, hz):
                 rss_after_kib=after["rss_kib"], children_included=False)
 
 
+def idle_sample(pid, expected_start, checked_light):
+    before = snapshot(pid)
+    if expected_start is not None and before["start_ticks"] != expected_start:
+        raise ValueError("idle process differs from the owner's bound child")
+    idle_wait(checked_light)
+    return idle_result(before, snapshot(pid), os.sysconf("SC_CLK_TCK"))
+
+
 def idle_wait(read_light, clock=time.monotonic, sleep=time.sleep):
     end = clock() + 60
     while True:
@@ -328,10 +336,13 @@ def main():
     parser.add_argument("--impl", choices=("python", "rust"), required=True)
     parser.add_argument("--service", choices=("ui", "power", "cpufreq", "netwatch"), default="ui")
     parser.add_argument("--pid", type=int)
+    parser.add_argument("--start-ticks", type=int, help="expected idle child start time from owner binding")
     parser.add_argument("--settings", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--back", type=int, nargs=2, metavar=("X", "Y"))
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+    if args.start_ticks is not None and (args.mode != "idle" or args.start_ticks < 0):
+        parser.error("--start-ticks requires idle mode and a nonnegative value")
     if args.mode != "startup" and (args.pid is None or args.pid <= 1):
         parser.error("--pid must identify the verified measured process")
     if args.mode == "taps" and (args.settings is None or args.back is None):
@@ -350,12 +361,10 @@ def main():
     if args.out.exists():
         raise FileExistsError("result path already exists")
     if args.mode == "idle":
-        before = snapshot(args.pid)
         def checked_light():
             preflight()
             return light()
-        idle_wait(checked_light)
-        result["measurement"] = idle_result(before, snapshot(args.pid), os.sysconf("SC_CLK_TCK"))
+        result["measurement"] = idle_sample(args.pid, args.start_ticks, checked_light)
     elif args.mode == "taps":
         result["measurement"] = taps(args.pid, args.settings, args.back)
     elif args.mode == "startup":

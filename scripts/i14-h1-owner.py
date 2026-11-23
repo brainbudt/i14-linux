@@ -206,7 +206,11 @@ class Owner:
             if time.monotonic()>=deadline:raise ValueError('natural screen timeout did not reach zero')
             time.sleep(1)
         self.ready()
-        payload(['python3','-B','/run/i14-h1.py','idle','--impl',impl,'--service',service,'--pid',str(binding['child']['pid']),'--out',str(out)],out,dict(identity=binding,light_before=self.h1.light(),clk_tck=os.sysconf('SC_CLK_TCK')))
+        child = binding['child']
+        argv = ['python3', '-B', '/run/i14-h1.py', 'idle', '--impl', impl,
+                '--service', service, '--pid', str(child['pid']),
+                '--start-ticks', str(child['start_ticks']), '--out', str(out)]
+        payload(argv, out, dict(identity=binding, light_before=self.h1.light(), clk_tck=os.sysconf('SC_CLK_TCK')))
     def startup(self,impl,out):
         self.identify('ui','rust');command(['rc-service','i14-ui','stop'])
         try:

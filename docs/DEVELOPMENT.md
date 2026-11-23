@@ -40,10 +40,10 @@ Use an existing project virtual environment if one is configured. Some older
 experimental tests and C host tests under `tests/` depend on local firmware,
 captures, or optional C/host tooling and are not part of the default CI matrix.
 
-The host-only M0 recovery-timing analyzer
-(`scripts/i14-k70-recovery-timing.py`) reads normalized synthetic traces and
-proves crash-to-return timing only, not device acceptance; see
-[K70 recovery timing](K70-RECOVERY-TIMING.md) for usage and the trace schema.
+The M0 analyzer reads normalized JSONL traces. The passive host capture writer
+and analyzer are tested together using synthetic observations. Capture hooks,
+the trace schema and the hardware gates are documented in
+[K70 recovery timing](K70-RECOVERY-TIMING.md).
 See [ROADMAP.md](ROADMAP.md) for remaining device acceptance gates.
 
 ## Current route: Alpine with the stock kernel

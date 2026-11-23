@@ -51,6 +51,12 @@ class HarnessTests(unittest.TestCase):
             with self.subTest(delta=delta), self.assertRaises(ValueError):
                 h1.idle_result(before, after, 100)
 
+    def test_idle_rejects_pid_reused_since_owner_selected_child(self):
+        with mock.patch.object(h1, "snapshot", return_value={"start_ticks": 901}), \
+                mock.patch.object(h1, "idle_wait") as wait, self.assertRaises(ValueError):
+            h1.idle_sample(42, 900, lambda: 0)
+        wait.assert_not_called()
+
     def test_idle_waits_sixty_seconds_and_refuses_screen_on(self):
         clock = Clock()
         h1.idle_wait(lambda: 0, clock.now, clock.sleep)

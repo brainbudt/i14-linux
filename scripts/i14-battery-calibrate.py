@@ -297,6 +297,8 @@ class Cycle:
             elif not step_ok:
                 raise ValueError("fuel-gauge counter jump")
         if self.phase == "charge":
+            if now - self.started >= 8*3600:
+                raise ValueError("full-charge deadline reached")
             if row["capacity"] <= 6:
                 raise ValueError("low-battery reserve before full anchor")
             full = (row["status"] == "Full" and row["voltage_mv"] >= 4300 and
@@ -309,8 +311,6 @@ class Cycle:
                 self.phase = "discharge"
                 self.anchor = self.stored(row)
                 self.segments = [self.segment(row)]
-            if self.phase == "charge" and now - self.started >= 8*3600:
-                raise ValueError("full-charge deadline reached")
         elif self.phase == "discharge":
             self.points += 1
             # Software cross-check: cached current (deci-mA) integrated over the same samples.

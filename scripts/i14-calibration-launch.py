@@ -18,7 +18,8 @@ COORDINATOR = os.environ.get('I14_COORDINATOR_ID', 'i14-coordinator')
 BASE = Path('/mnt/data/media/0/i14-linux')
 CODE = BASE / ('battery-calibration-code-' + CAMPAIGN)
 CONTROL = BASE / ('battery-calibration-' + CAMPAIGN + '-control')
-MEASURE_SHA = 'be92a25370ab8f0f97f89ee36a303a60822bd97bfca9e2b26e25c98508b455a6'
+MEASUREMENT_LOCK = Path('/run/i14-battery-calibration.lock')
+MEASURE_SHA = 'b6ffb1489e13f17096ceb3e4de88fb2d914a997beb0840562c925f3e3a5e985b'
 RUN_SECONDS, RECOVERY_SECONDS, CAMPAIGN_SECONDS = 32*3600, 4*3600, 72*3600
 MIB = 1024**2
 MAX_RECORD_BYTES, MAX_INPUT_BYTES, MAX_ACKS = 8*MIB, 256*1024, 80
@@ -119,8 +120,21 @@ def storage_required(gate):
             'missing reviewed quota/retention proof')
     extra=[storage[key] for key in ('observer_fixed_bytes','background_growth_bytes')]
     require(all(type(value) is int and value>=0 for value in extra), 'invalid storage ceiling')
+    require(storage['observer_fixed_bytes'] >= MIB, 'insufficient fixed observer overhead')
     require(storage['background_growth_bytes']>=C13_GUARD_LOG_BYTES, 'insufficient C13 guard log allowance')
     return max(2*1024**3,C13_BYTES+OBSERVER_BYTES+COMMISSION_BYTES+ALLOCATION_BYTES+RESERVE_BYTES+sum(extra))
+
+
+def userdata_free_bytes():
+    fd = os.open(BASE, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        device = os.fstat(fd).st_dev
+        uevent = Path('/sys/dev/block') / f'{os.major(device)}:{os.minor(device)}' / 'uevent'
+        require('PARTNAME=userdata' in uevent.read_text().splitlines(), 'campaign path is not on userdata')
+        space = os.fstatvfs(fd)
+        return space.f_bavail * space.f_frsize
+    finally:
+        os.close(fd)
 
 
 def validate_gate(gate, now):
@@ -214,7 +228,8 @@ def finish_attempt(path, attempt, rc, result, restore_rc, ended_epoch, *, clock_
     except (OSError,ValueError,KeyError,TypeError):
         pass
     success=rc==0 and restore_rc==0 and clock_ok and experiment_gone and result is not None and result.is_file()
-    if not clock_ok: rc=1
+    if not success and rc == 0:
+        rc = 1
     if checkpoint:
         if type(checkpoint.get('acknowledged_epoch')) is int:
             record['last_epoch']=max(record['last_epoch'],checkpoint['acknowledged_epoch'])
@@ -313,7 +328,7 @@ def live_preflight(gate, package, directory):
             guard.get('online') is True,
             'production guard not ready')
     require(all(service('status',name)==0 for name in SERVICES), 'service not started')
-    require(os.statvfs(BASE).f_bavail*os.statvfs(BASE).f_frsize>=storage_required(gate),
+    require(userdata_free_bytes()>=storage_required(gate),
             'insufficient combined C13/observer/closure storage (2GiB floor retained)')
     spec=importlib.util.spec_from_file_location('measure',directory/'measure.py')
     measure=importlib.util.module_from_spec(spec); spec.loader.exec_module(measure)
@@ -379,7 +394,7 @@ def run_gate(path):
                             exited=True
                         except subprocess.TimeoutExpired:
                             pass
-                        if os.statvfs(BASE).f_bavail*os.statvfs(BASE).f_frsize<=512*1024**2:
+                        if userdata_free_bytes()<=RESERVE_BYTES:
                             stop_requested[0]=True
                         wall,mono=int(time.time()),time.monotonic()
                         if not supervision_valid(record,read_json(CONTROL/'checkpoint.json'),wall,mono,
@@ -409,16 +424,24 @@ def run_gate(path):
             # A live or uncertain experiment keeps ownership. Never start a second BCCT writer.
             gone=child is None or child.poll() is not None
             pid=measurement_pid(data,directory)
-            if gone and pid is None:
-                restore=service('start')
-            else:
-                rc=1
+            gone = gone and pid is None
+            if gone:
+                # The measurement holds this lock for its entire lifetime, including cleanup.
+                # An unavailable PID file alone cannot rule out a surviving BCCT writer.
+                try:
+                    with MEASUREMENT_LOCK.open('a') as measure_lock:
+                        fcntl.flock(measure_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        restore=service('start')
+                except OSError as exc:
+                    supervisor_error=supervisor_error or exc
+                    gone=False
+            if not gone: rc=1
             if stop_requested[0]: rc=1
             finished=finish_attempt(CONTROL/'campaign.json',attempt,rc,data/'result.json',restore,int(time.time()),
-                                    clock_floor=(seen_wall,seen_mono),experiment_gone=gone and pid is None)
+                                    clock_floor=(seen_wall,seen_mono),experiment_gone=gone)
             rc=finished['exit_code']
             write_json(CONTROL/f'wrapper-result-{attempt}.json',dict(exit_code=rc,
-                       production_start_rc=restore,experiment_gone=gone and pid is None,
+                       production_start_rc=restore,experiment_gone=gone,
                        supervisor_error=repr(supervisor_error) if supervisor_error else None,
                        restoration_accepted=False,finished_epoch=int(time.time())),new=True)
             for sig,handler in old_handlers.items(): signal.signal(sig,handler)
@@ -443,7 +466,7 @@ def checkpoint(stop=False):
         state=optional(data/'state.json'),failure=optional(data/'failure.json'),
         result=optional(data/'result.json'),wrapper=optional(CONTROL/f'wrapper-result-{attempt}.json'),
         guard=optional(Path('/run/i14-charge-status.json')),epoch=int(time.time()),
-        free_bytes=os.statvfs(BASE).f_bavail*os.statvfs(BASE).f_frsize),allow_nan=False))
+        free_bytes=userdata_free_bytes()),allow_nan=False))
 
 
 def ack_file(path):

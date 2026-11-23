@@ -127,27 +127,49 @@ esac
             self.assertIn(f"rc-service -D {service} stop", log)
         self.assertNotIn("--dport", log)
 
+
+class DnsClientPolicy(unittest.TestCase):
+    paths = ("etc/i14/firewall.rules", "etc/unbound/unbound.conf")
+
+    def render(self, contents):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = pathlib.Path(directory.name)
+        for path in self.paths:
+            (root / path).parent.mkdir(parents=True)
+            (root / path).write_bytes((O / path).read_bytes())
+        clients = root / "clients"
+        if contents is not None:
+            clients.write_text(contents)
+        result = subprocess.run([sys.executable, ROOT / "rootfs/configure-dns.py", root, clients],
+                                capture_output=True, text=True)
+        return result, [(root / path).read_text() for path in self.paths]
+
     def test_dns_sources_render_to_both_services(self):
-        with tempfile.TemporaryDirectory() as directory:
-            d = pathlib.Path(directory)
-            for path in ("etc/i14/firewall.rules", "etc/unbound/unbound.conf"):
-                (d / path).parent.mkdir(parents=True, exist_ok=True)
-                (d / path).write_bytes((O / path).read_bytes())
-            clients = d / "clients"
-            clients.write_text("192.0.2.20/32 # example\n198.51.100.8/29\n")
-            tool = ROOT / "rootfs/configure-dns.py"
-            result = subprocess.run([sys.executable, tool, d, clients], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            firewall = (d / "etc/i14/firewall.rules").read_text()
-            unbound = (d / "etc/unbound/unbound.conf").read_text()
-            for cidr in ("192.0.2.20/32", "198.51.100.8/29"):
-                self.assertIn(f"-A I14_DNS -s {cidr} -j ACCEPT", firewall)
-                self.assertIn(f"access-control: {cidr} allow", unbound)
-            for invalid in ("0.0.0.0/0", "2001:db8::1/128", "192.0.2.7/24", "x; echo ignored"):
-                clients.write_text(invalid)
-                result = subprocess.run([sys.executable, tool, d, clients], capture_output=True)
-                self.assertNotEqual(result.returncode, 0, invalid)
-                self.assertEqual((d / "etc/i14/firewall.rules").read_text(), firewall)
+        result, (firewall, unbound) = self.render("192.0.2.20/32 # example\n198.51.100.8/29\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for cidr in ("192.0.2.20/32", "198.51.100.8/29"):
+            self.assertIn(f"-A I14_DNS -s {cidr} -j ACCEPT", firewall)
+            self.assertIn(f"access-control: {cidr} allow", unbound)
+
+    def test_invalid_dns_clients_leave_both_templates_unchanged(self):
+        for invalid in ("0.0.0.0/0", "127.0.0.0/8", "2001:db8::1/128", "192.0.2.7/24", "x; echo ignored"):
+            with self.subTest(invalid=invalid):
+                result, configs = self.render(invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid IPv4 client network at line 1", result.stderr)
+                self.assertEqual(configs, [(O / path).read_text() for path in self.paths])
+
+    def test_empty_dns_clients_allow_only_local_queries(self):
+        for contents in (None, "", "\n  # no clients\n"):
+            with self.subTest(contents=contents):
+                result, (firewall, unbound) = self.render(contents)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("# I14_DNS_CLIENTS", firewall + unbound)
+                self.assertNotIn("-A I14_DNS ", firewall)
+                self.assertEqual([line.strip() for line in unbound.splitlines()
+                                  if line.strip().startswith("access-control:")],
+                                 ["access-control: 0.0.0.0/0 refuse", "access-control: 127.0.0.0/8 allow"])
 
 
 class Dns(unittest.TestCase):

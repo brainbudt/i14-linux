@@ -23,8 +23,8 @@ KERNEL = "3.18.19-stock"
 IMAGE = "alpine-v10c-img"
 
 
-def load_module():
-    spec = importlib.util.spec_from_file_location("i14_k70_recovery_timing_test", SCRIPT)
+def load_module(path=SCRIPT):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -122,6 +122,55 @@ class TimingTests(TraceCase):
         self.assertEqual(code, 1)
         self.assertEqual(output["verdict"], "OVER_LIMIT")
         self.assertEqual(output["recovery"]["duration_s"], 40.001)
+
+    def test_submicrosecond_overrun_is_over_limit(self):
+        code, output = self.run_main(records(1000, 1040.0000004))
+        self.assertEqual(code, 1)
+        self.assertGreater(output["recovery"]["duration_unrounded_s"], 40)
+
+    def test_captures_both_triggers_and_first_confirmed_new_boot(self):
+        writer = load_module(SCRIPT.with_name("i14_k70_capture.py"))
+        for method in ("sysrq-crash", "keeper-stop"):
+            with self.subTest(method=method), (self.root/method).open("x") as trace:
+                capture = writer.RecoveryCapture(trace, previous_boot="previous", experimental_boot=EXP_BOOT,
+                                                kernel=KERNEL, image=IMAGE)
+                with mock.patch.object(writer.time, "monotonic", side_effect=[100, 110, 120, 125, 130, 140]):
+                    with capture.trigger(method):
+                        pass
+                    for boot, kernel, image in (("previous", KERNEL, IMAGE), (EXP_BOOT, KERNEL, IMAGE),
+                                                (PROD_BOOT, "other", IMAGE), (PROD_BOOT, KERNEL, "other")):
+                        self.assertFalse(capture.observe_return(boot_id=boot, kernel=kernel, image=image))
+                    self.assertTrue(capture.observe_return(boot_id=PROD_BOOT, kernel=KERNEL, image=IMAGE))
+                for item in valid_stages():
+                    capture.stage(item["stage"], item["phase"], item["boot_id"], item["t_s"])
+                code, output = self.run_main(Path(trace.name).read_text())
+                self.assertEqual(code, 0)
+                self.assertEqual(output["recovery"]["trigger_method"], method)
+                self.assertEqual(output["recovery"]["duration_s"], 40)
+                self.assertEqual(output["diagnostics"]["unconfirmed_returns"], 4)
+                self.assertEqual(output["stage_evidence"], "valid")
+
+    def test_refused_dispatch_leaves_an_incomplete_trace_and_disallows_retry(self):
+        writer = load_module(SCRIPT.with_name("i14_k70_capture.py"))
+        stream = io.StringIO()
+        capture = writer.RecoveryCapture(stream, previous_boot="previous", experimental_boot=EXP_BOOT,
+                                        kernel=KERNEL, image=IMAGE)
+        with self.assertRaises(OSError), capture.trigger("sysrq-crash"):
+            raise OSError("dispatch unconfirmed")
+        with self.assertRaises(ValueError), capture.trigger("sysrq-crash"):
+            self.fail("retried")
+        with self.assertRaises(ValueError):
+            capture.observe_return(boot_id=PROD_BOOT, kernel=KERNEL, image=IMAGE)
+        self.assertEqual(self.run_main(stream.getvalue())[1]["verdict"], "INCOMPLETE")
+
+    def test_external_trace_rejects_old_production_boot_and_unknown_trigger(self):
+        trace = records()
+        trace[0]["previous_production_boot_id"] = PROD_BOOT
+        trace[1]["method"] = "reboot"
+        code, output = self.run_main(trace)
+        self.assertEqual(code, 2)
+        self.assertIn("previous_production_boot", self.reasons(output))
+        self.assertIn("unknown_trigger_method", self.reasons(output))
 
     def test_historical_70_6_seconds_is_over_limit(self):
         code, output = self.run_main(records(1000.0, 1070.6))
@@ -356,8 +405,11 @@ class EvidenceTests(TraceCase):
     def test_record_limits_are_enforced(self):
         with mock.patch.object(self.module, "MAX_RECORDS", 2):
             code, output = self.run_main(records())
-        self.assertEqual(code, 2)
-        self.assertIn("too_many_records", self.reasons(output))
+            self.assertEqual(code, 2)
+            self.assertIn("too_many_records", self.reasons(output))
+            code, output = self.run_main("\n\n\n")
+            self.assertEqual(code, 2)
+            self.assertIn("too_many_records", self.reasons(output))
         with mock.patch.object(self.module, "MAX_TRACE_BYTES", 16):
             code, output = self.run_main(records())
         self.assertEqual(code, 2)
@@ -408,8 +460,7 @@ class StageTests(TraceCase):
         self.assertEqual(code, 0)
         self.assertIn("duplicate_stage_start", self.stage_reasons(output))
         self.assertIn("duplicate_stage_end", self.stage_reasons(output))
-        self.assertEqual(output["stages"][0]["start_uptime_s"], 0.2)
-        self.assertEqual(output["stages"][1]["end_uptime_s"], 6.5)
+        self.assertEqual([item["stage"] for item in output["stages"]], ["mdev_coldplug"])
 
     def test_unpaired_stages_are_called_out_and_never_measured(self):
         trace = records() + [stage("early_init", "start", 0.2),

@@ -30,6 +30,9 @@ firmware dumps, images, credentials and raw captures outside Git.
 
 ### Unattended collector & 48-hour Soak C (H2/H3)
 
+The [H1, Soak C and H3 execution sequence](verification/H1-SOAK-C.md) lists
+the commissioning steps, commands and evidence required for these gates.
+
 - Commission a phone-local collector and export path with bounded retention and
   clean process teardown before starting a 48-hour acceptance window.
 - Freeze exact boot/rootfs identity, runtime hashes, sampler and probe settings,
@@ -59,6 +62,7 @@ firmware dumps, images, credentials and raw captures outside Git.
 - Verify userdata free space, log retention budget and unattended supervision
   (`scripts/i14-calibration-launch.py`) before running a bounded two-cycle
   calibration campaign (fit on cycle 1, independent holdout on cycle 2).
+  See the [C13 and production charge-band sequence](C13-READINESS.md).
 
 ### Nearly-empty recovery (D)
 
