@@ -24,6 +24,11 @@ python3 -B initramfs/test-usb-network.py
 python3 -B initramfs/test-display-packaging.py
 ```
 
+The rootfs builder uses `rootfs/make-android-props.py` to write the Android 6
+property area for the MediaTek Wi-Fi tools. With Cargo available, the Python
+host suite builds `i14-make-android-props` and compares the two writers'
+output bytes, path handling and exit codes in temporary directories.
+
 For the Rust workspace (pinned to Rust `1.98.1` in `rust/rust-toolchain.toml`
 and `rust/mise.toml`; see [rust/README.md](../rust/README.md)):
 
