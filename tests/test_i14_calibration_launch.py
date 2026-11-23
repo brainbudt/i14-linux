@@ -57,6 +57,24 @@ class Launch(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'C13 guard log allowance'):
             launch.validate_gate(value,NOW)
 
+    def test_fixed_observer_overhead_must_be_funded(self):
+        value = gate()
+        value['storage']['observer_fixed_bytes'] = launch.MIB - 1
+        with self.assertRaisesRegex(ValueError, 'observer'):
+            launch.validate_gate(value, NOW)
+
+    def test_free_space_must_come_from_the_userdata_backing_device(self):
+        with mock.patch.object(launch, 'BASE', self.root), \
+             mock.patch.object(Path, 'read_text', autospec=True) as uevent, \
+             mock.patch.object(launch.os, 'fstatvfs', return_value=SimpleNamespace(f_bavail=3, f_frsize=4096)):
+            uevent.return_value = 'PARTNAME=userdata\n'
+            self.assertEqual(launch.userdata_free_bytes(), 12288)
+            dev = self.root.stat().st_dev
+            uevent.assert_called_once_with(Path(f'/sys/dev/block/{launch.os.major(dev)}:{launch.os.minor(dev)}/uevent'))
+            uevent.return_value = 'PARTNAME=other\n'
+            with self.assertRaisesRegex(ValueError, 'userdata'):
+                launch.userdata_free_bytes()
+
     def test_record_and_gate_limits_refuse_before_replacing_or_reading(self):
         path=self.root/'record.json'; path.write_text('{}')
         with mock.patch.object(launch,'MAX_RECORD_BYTES',8):
@@ -193,6 +211,14 @@ class Launch(unittest.TestCase):
                 self.assertEqual(record['attempts'],1)
                 self.assertFalse(receipt['restoration_accepted'])
                 self.assertEqual(receipt['production_start_rc'],restore_rc)
+                self.assertEqual(receipt['exit_code'] == 0, want == 'awaiting_review')
+
+    def test_missing_result_cannot_exit_successfully(self):
+        state = self.root / 'campaign.json'
+        launch.reserve_attempt(state, gate(), NOW, 'a'*64)
+        finished = launch.finish_attempt(state, 1, 0, self.root/'result.json', 0, NOW+1)
+        self.assertEqual(finished['state'], 'stopped')
+        self.assertNotEqual(finished['exit_code'], 0)
 
     def test_supervision_exception_terminates_verified_child_and_restores_after_reap(self):
         control=self.root/'held'
@@ -252,6 +278,24 @@ class Launch(unittest.TestCase):
         self.assertFalse(receipt['experiment_gone'])
         self.assertIsNone(receipt['production_start_rc'])
 
+    def test_reaped_timeout_and_missing_pid_do_not_override_a_live_measurement_lock(self):
+        control = self.root / 'lock-held'
+        with (self.root/'measurement.lock').open('a') as lock:
+            launch.fcntl.flock(lock, launch.fcntl.LOCK_EX)
+            with self.assertRaises(BlockingIOError):
+                self.run_wrapper(control, 0, 0)
+        record = json.loads((control/'campaign.json').read_text())
+        self.assertEqual(record['state'], 'stopping')
+        self.assertIsNone(record['production_start_rc'])
+        self.assertNotEqual(record['exit_code'], 0)
+
+    def test_userdata_at_reserve_stops_even_if_child_returns_zero(self):
+        control = self.root / 'space-floor'
+        self.run_wrapper(control, 0, 0, scenario='space-floor')
+        record = json.loads((control/'campaign.json').read_text())
+        self.assertEqual(record['state'], 'stopped')
+        self.assertNotEqual(record['exit_code'], 0)
+
     def run_wrapper(self,control,child_rc,restore_rc,live=False,missed=False,scenario=None):
         bundle=self.root/('bundle-'+control.name)
         launch.build_bundle(bundle)
@@ -301,11 +345,13 @@ class Launch(unittest.TestCase):
         with mock.patch.object(launch,'__file__',str(bundle/'launcher.py')), \
              mock.patch.object(launch,'CODE',bundle),mock.patch.object(launch,'CONTROL',control), \
              mock.patch.object(launch,'BASE',base), \
+             mock.patch.object(launch,'MEASUREMENT_LOCK',self.root/'measurement.lock'), \
              mock.patch.object(launch,'live_preflight',return_value={'boot_id':BOOT}), \
              mock.patch.object(launch.time,'time',side_effect=lambda:clock['wall']), \
              mock.patch.object(launch.time,'monotonic',side_effect=lambda:clock['mono']), \
              mock.patch.object(launch.subprocess,'Popen',side_effect=spawn), \
-             mock.patch.object(launch.os,'statvfs',return_value=SimpleNamespace(f_bavail=10**9,f_frsize=4096)), \
+             mock.patch.object(launch,'userdata_free_bytes',return_value=launch.RESERVE_BYTES +
+                               (0 if scenario == 'space-floor' else 1)), \
              mock.patch.object(launch,'measurement_pid',side_effect=lambda *a:123456 if not done[0] else None), \
              mock.patch.object(launch.os,'kill',side_effect=lambda *args:signals.append(args)), \
              mock.patch.object(launch,'service',side_effect=restore):

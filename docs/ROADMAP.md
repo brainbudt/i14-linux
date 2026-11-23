@@ -59,6 +59,7 @@ firmware dumps, images, credentials and raw captures outside Git.
 - Verify userdata free space, log retention budget and unattended supervision
   (`scripts/i14-calibration-launch.py`) before running a bounded two-cycle
   calibration campaign (fit on cycle 1, independent holdout on cycle 2).
+  See the [C13 and production charge-band sequence](C13-READINESS.md).
 
 ### Nearly-empty recovery (D)
 
