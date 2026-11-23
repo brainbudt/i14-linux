@@ -1,14 +1,15 @@
 # I14 Linux Roadmap & Acceptance Gates
 
 This roadmap summarizes the active engineering milestones and remaining device
-acceptance gates as of 22 November 2026. The near-term goal is a maintained
+acceptance gates as of 23 November 2026. The near-term goal is a maintained
 source baseline on `main`, verified offline backup tooling, and measured
 acceptance of one production Alpine image on the stock 3.18.19 kernel. Linux 7
 mainline bring-up is a separate track with its own recovery gate.
 
 Window B was accepted for its measured version. `B5` is the latest recorded
-restoration baseline. Python remains in the image alongside the Rust workspace
-for parity comparisons and recovery.
+restoration baseline. On 23 November, all seven deployed ARM64 musl binaries
+matched the release hashes, and the hardware probe passed 8/8 checks. Python
+remains in the image for parity comparisons and recovery.
 
 ## 1. Source baseline & host verification
 
@@ -20,6 +21,14 @@ for parity comparisons and recovery.
   `rust/crates/i14-tools`) covering SHA-256 manifests, primary/backup GPT
   headers and entry arrays, and all 23 partition lengths. File integrity checks
   and physical restore remain separate acceptance criteria.
+- PR #3 added offline rootfs trial staging and verification
+  ([swap tool](../scripts/i14-rootfs-swap.py)), Soak C observer/export/receive
+  checks, C13 launcher deadlines, M0 host timing anchors and fastboot
+  diagnostic parity.
+- The [offline DNS/power correlator](SOAK-CORRELATE.md) processed 199/199
+  usable intervals from 200 real B5 power samples with synthetic DNS answers.
+  The Rust `i14-make-android-props` host tool matched the Python writer's
+  128 KiB output byte-for-byte.
 
 ## 2. Stock-kernel device acceptance items
 
@@ -28,13 +37,24 @@ partition, image hash, source revision and rollback status. Never read
 `current_cmd` during charging tests (reading it disables charging). Keep
 firmware dumps, images, credentials and raw captures outside Git.
 
+### Security-hardened stock boot image and rootfs
+
+Deploy and accept the new boot image and rootfs together. Verify locally
+activated, authenticated USB rescue, the fail-closed dual-stack firewall and
+private settings permissions (`0700` directory, `0600` files). B5 answered the
+local DNS health query on 23 November. Its installed `unbound-1.25.2-r2` lacks
+the fixes for CVE-2026-81634 and CVE-2026-96405. Keep `dns-clients.conf`
+empty for acceptance until the candidate package manifest confirms both fixes.
+[Build and package requirements](DEVELOPMENT.md).
+
 ### Unattended collector & 48-hour Soak C (H2/H3)
 
 The [H1, Soak C and H3 execution sequence](verification/H1-SOAK-C.md) lists
 the commissioning steps, commands and evidence required for these gates.
 
-- Commission a phone-local collector and export path with bounded retention and
-  clean process teardown before starting a 48-hour acceptance window.
+- Commissioning passed on B5 on 23 November. Root `crond` completed a bounded
+  capture, the original crontab was restored byte-for-byte and no collector or
+  lock remained. The receiver verified all 18 streamed files (9,715,485 bytes).
 - Freeze exact boot/rootfs identity, runtime hashes, sampler and probe settings,
   and audit conditions 0–5 (`scripts/i14-window-audit.py`), then run 48
   uninterrupted hours and record the verdict plus read-only Rust CPU/memory
@@ -53,15 +73,19 @@ the commissioning steps, commands and evidence required for these gates.
   `5,167,890,432` bytes while keeping the active `B5` image, historical
   rollback copy and trial records intact.
 - Current disposition remains `KEEP_B5 / R_DEFERRED_INTEGRITY` until a fresh
-  candidate image, pre-Unbound `root.key` carry proof, automatic rollback
-  rehearsal (`docs/ROOTFS-SWAP-ROLLBACK.md`), and full restoration verification
+  candidate image, pre-Unbound `root.key` carry proof, [automatic rollback
+  rehearsal](ROOTFS-SWAP-ROLLBACK.md), and full restoration verification
   are accepted.
 
-### Battery calibration (C13)
+### Battery calibration (C13) and the 80% charge band
 
+- B5 reported `gauge_mode: "hw_car"` and `anchored: false` on 23 November.
+  The capacity estimate still needs calibration.
 - Verify userdata free space, log retention budget and unattended supervision
   (`scripts/i14-calibration-launch.py`) before running a bounded two-cycle
   calibration campaign (fit on cycle 1, independent holdout on cycle 2).
+- Verify a full natural stop/resume cycle at an unchanged 80% limit and
+  hysteresis after the guard crashes inside the band.
   See the [C13 and production charge-band sequence](C13-READINESS.md).
 
 ### Nearly-empty recovery (D)

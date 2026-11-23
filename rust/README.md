@@ -16,7 +16,7 @@ image integration and device acceptance.
 | `i14-soak` | the minute soak sampler (`i14-soak-sample`, run from cron on userdata) |
 | `i14-util` | small phone tools: `i14-reboot-bootloader` (reboot into fastboot) |
 | `i14-charge` | prepared, not in the boot image: `i14-charge-wait`, the power-off charging loop of the initramfs |
-| `i14-tools` | host tool for the Mac: `i14-build-boot` with the authenticated rescue overlay |
+| `i14-tools` | host tools for boot images (`i14-build-boot`), firmware backups (`i14-verify-backup`) and Android properties (`i14-make-android-props`) |
 | `i14-fastboot` | host tools for the Mac: `i14-fastboot`, `i14-install-boot` (= `scripts/fastboot_usb.py`, `install_boot_usb.py`); USB via `nusb` |
 
 The rootfs builder on `main` still installs the existing services. The plan for
@@ -49,6 +49,15 @@ shasum -a 256 target/aarch64-unknown-linux-musl/release/i14-probe
 
 `Cargo.lock` pins dependency versions. Two clean builds of `i14-probe` on the
 same Mac gave the same hash.
+
+## Write the Android property area
+
+From `rust/`, run the host writer with an output path. It creates parent
+directories and writes the 128 KiB bionic property area used by the Wi-Fi tools.
+
+```sh
+mise exec -- cargo run --locked -p i14-tools --bin i14-make-android-props -- ./android-properties
+```
 
 ## Verify a firmware backup offline
 

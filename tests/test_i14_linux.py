@@ -1,9 +1,12 @@
 import gzip
 import importlib.util
+import os
 import pathlib
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 import zlib
 
@@ -106,6 +109,87 @@ class Properties(unittest.TestCase):
         for key, value in props.items():
             self.assertEqual(bionic_find(stock.read_bytes(), key), value)
             self.assertEqual(bionic_find(rebuilt, key), value)
+
+
+class RustPropsWriter(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            raise unittest.SkipTest("Rust property writer parity requires cargo")
+        workspace = ROOT / "rust"
+        binary = "i14-make-android-props"
+        # CI runs Python first. Cargo also refreshes an existing binary after edits.
+        subprocess.run([cargo, "build", "--locked", "-p", "i14-tools", "--bin", binary,
+                        "--target-dir", "target"], cwd=workspace, check=True)
+        cls.rust = [workspace / "target/debug" / binary]
+        cls.python = [sys.executable, "-B", ROOT / "rootfs/make-android-props.py"]
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dirs = [pathlib.Path(tmp.name) / tag for tag in ("python", "rust")]
+        for directory in self.dirs:
+            directory.mkdir()
+
+    def run_both(self, args, status=None):
+        results = []
+        for command, cwd in zip((self.python, self.rust), self.dirs):
+            result = subprocess.run([*command, *args], cwd=cwd, capture_output=True, timeout=10)
+            results.append(result)
+        python, rust = results
+        self.assertEqual(rust.returncode, python.returncode, (rust.stderr, python.stderr))
+        if status is not None:
+            self.assertEqual(python.returncode, status, python.stderr)
+        return results
+
+    def test_property_area_and_paths(self):
+        props = load("props_oracle", "rootfs/make-android-props.py")
+        for args in (["nested/é/props"], ["trailing/"], ["dot/."], ["missing/../props"],
+                     ["-"], ["-1"], ["-.5"], ["-١٢"], ["-file name"], ["--", "-h"], ["--", "--"]):
+            with self.subTest(args=args):
+                results = self.run_both(args, 0)
+                for result in results:
+                    self.assertEqual((result.stdout, result.stderr), (b"", b""))
+                py, rs = [(directory / args[-1]).read_bytes() for directory in self.dirs]
+                self.assertEqual(rs, py)
+                self.assertEqual(len(rs), 128 * 1024)
+                for key, value in props.PROPS.items():
+                    self.assertEqual(bionic_find(rs, key), value)
+
+    def test_overwrites_through_symlink(self):
+        for directory in self.dirs:
+            (directory / "old").write_bytes(b"x" * (128 * 1024 + 1))
+            (directory / "link").symlink_to("old")
+        self.run_both(["link"], 0)
+        py, rs = [(directory / "old").read_bytes() for directory in self.dirs]
+        self.assertEqual(rs, py)
+        self.assertEqual(len(rs), 128 * 1024)
+        self.assertTrue(all((directory / "link").is_symlink() for directory in self.dirs))
+
+    def test_non_utf8_path(self):
+        name = os.fsdecode(b"props-\xff")
+        python, rust = self.run_both([name])
+        # Some filesystems (including APFS) reject this byte sequence.
+        if python.returncode == 0:
+            py, rs = [(directory / name).read_bytes() for directory in self.dirs]
+            self.assertEqual(rs, py)
+        else:
+            self.assertEqual(python.returncode, 1, python.stderr)
+            self.assertTrue(rust.stderr)
+
+    def test_exit_codes(self):
+        for directory in self.dirs:
+            (directory / "blocker").touch()
+        for args, code in ((["--help"], 0), (["--hel"], 0), (["-hh"], 0), ([], 2),
+                           (["--unknown"], 2), (["--help=value", "-h"], 2), (["-hh-"], 2),
+                           (["-²"], 2), (["-=not a path"], 2), (["a", "b"], 2),
+                           (["."], 1), (["blocker/sub/out"], 1)):
+            with self.subTest(args=args):
+                for result in self.run_both(args, code):
+                    self.assertTrue(result.stderr if code else result.stdout)
+        self.assertEqual([sorted(p.name for p in d.iterdir()) for d in self.dirs],
+                         [["blocker"], ["blocker"]])
 
 
 class Scripts(unittest.TestCase):
